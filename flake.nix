@@ -16,9 +16,10 @@
       };
 
       lib = pkgs.lib;
-      commonPackages = [
-        pkgs.nodejs_22
-        pkgs.pnpm
+      commonPackages = with pkgs; [
+        nodejs_22
+        pnpm
+        bun
       ];
     in {
       devShells = {
