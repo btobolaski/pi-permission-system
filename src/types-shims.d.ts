@@ -71,6 +71,18 @@ declare module "node:url" {
   export function fileURLToPath(url: unknown): string;
 }
 
+declare module "node:child_process" {
+  export interface ChildProcess {
+    stdin: any;
+    stdout: any;
+    stderr: any;
+    pid?: number;
+    kill(signal?: string): boolean;
+    on(event: string, listener: (...args: any[]) => void): this;
+  }
+  export function spawn(command: string, args?: string[], options?: any): ChildProcess;
+}
+
 declare module "bun:test" {
   export const mock: {
     module(name: string, factory: () => Record<string, unknown>): void;

@@ -5,6 +5,10 @@ import { join } from "node:path";
 
 import { BashFilter } from "./bash-filter.js";
 import { DEFAULT_EXTENSION_CONFIG, loadPermissionSystemConfig, savePermissionSystemConfig } from "./extension-config.js";
+import { piToolNameToClaudeCode, findMatchingHookCommands } from "./hook-matcher.js";
+import { executePreToolUseHook } from "./hook-executor.js";
+import { mergeHookDecisions, runPreToolUseHooks } from "./hook-runner.js";
+import type { PreToolUseHookMatcher, PreToolUseHookResult } from "./hook-types.js";
 import { createPermissionSystemLogger } from "./logging.js";
 import {
   createPermissionForwardingLocation,
@@ -52,9 +56,41 @@ function createManager(
   };
 }
 
-function runTest(name: string, testFn: () => void): void {
-  testFn();
-  console.log(`[PASS] ${name}`);
+// Accepts raw Record instead of GlobalPermissionConfig so tests can include
+// fields like `hooks` that are parsed by PermissionManager but not part of the typed config.
+function createManagerFromRaw(config: Record<string, unknown>) {
+  const baseDir = mkdtempSync(join(tmpdir(), "pi-permission-system-test-"));
+  const globalConfigPath = join(baseDir, "pi-permissions.jsonc");
+  const agentsDir = join(baseDir, "agents");
+
+  mkdirSync(agentsDir, { recursive: true });
+  writeFileSync(globalConfigPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+
+  const manager = new PermissionManager({ globalConfigPath, agentsDir });
+
+  return {
+    manager,
+    configPath: globalConfigPath,
+    cleanup: (): void => {
+      rmSync(baseDir, { recursive: true, force: true });
+    },
+  };
+}
+
+const pendingAsyncTests: Promise<void>[] = [];
+
+function runTest(name: string, testFn: () => void | Promise<void>): void {
+  const result = testFn();
+  if (result && typeof (result as any).then === "function") {
+    pendingAsyncTests.push(
+      (result as Promise<void>).then(
+        () => { console.log(`[PASS] ${name}`); },
+        (error: any) => { console.error(`[FAIL] ${name}`); throw error; },
+      ),
+    );
+  } else {
+    console.log(`[PASS] ${name}`);
+  }
 }
 
 runTest("Permission-system extension config defaults debug off, review log on, and yolo mode off", () => {
@@ -1022,4 +1058,785 @@ runTest("Permission forwarding rejects unresolved sentinel session ids", () => {
   assert.equal(targetSessionId, null);
 });
 
+// --- PreToolUse Hook Tests ---
+
+function hookMatcher(matcher: string, hooks: any[]): PreToolUseHookMatcher {
+  return { matcher, matcherRegex: new RegExp(`^(?:${matcher})$`), hooks };
+}
+
+runTest("piToolNameToClaudeCode maps Pi built-in tool names to Claude Code convention", () => {
+  assert.equal(piToolNameToClaudeCode("bash", {}), "Bash");
+  assert.equal(piToolNameToClaudeCode("read", {}), "Read");
+  assert.equal(piToolNameToClaudeCode("write", {}), "Write");
+  assert.equal(piToolNameToClaudeCode("edit", {}), "Edit");
+  assert.equal(piToolNameToClaudeCode("grep", {}), "Grep");
+  assert.equal(piToolNameToClaudeCode("find", {}), "Glob");
+  assert.equal(piToolNameToClaudeCode("ls", {}), "LS");
+  assert.equal(piToolNameToClaudeCode("skill", {}), "Skill");
+});
+
+runTest("piToolNameToClaudeCode passes through unknown tool names unchanged", () => {
+  assert.equal(piToolNameToClaudeCode("task", {}), "task");
+  assert.equal(piToolNameToClaudeCode("custom_tool", {}), "custom_tool");
+});
+
+runTest("piToolNameToClaudeCode derives mcp__server__tool from MCP input", () => {
+  assert.equal(
+    piToolNameToClaudeCode("mcp", { tool: "exa:search" }),
+    "mcp__exa__search",
+  );
+  assert.equal(
+    piToolNameToClaudeCode("mcp", { tool: "git-read-only:status", server: "git-read-only" }),
+    "mcp__git-read-only__status",
+  );
+  assert.equal(
+    piToolNameToClaudeCode("mcp", { tool: "search", server: "exa" }),
+    "mcp__exa__search",
+  );
+  assert.equal(piToolNameToClaudeCode("mcp", { server: "exa" }), "mcp__exa");
+  assert.equal(piToolNameToClaudeCode("mcp", {}), "mcp");
+});
+
+runTest("findMatchingHookCommands matches on regex matcher field", () => {
+  const matchers: PreToolUseHookMatcher[] = [
+    hookMatcher("Bash", [{ type: "command", command: "echo bash" }]),
+    hookMatcher("Read|Write", [{ type: "command", command: "echo rw" }]),
+  ];
+
+  const bashMatches = findMatchingHookCommands(matchers, "Bash", {});
+  assert.equal(bashMatches.length, 1);
+  assert.equal(bashMatches[0].command, "echo bash");
+
+  const readMatches = findMatchingHookCommands(matchers, "Read", {});
+  assert.equal(readMatches.length, 1);
+  assert.equal(readMatches[0].command, "echo rw");
+
+  const grepMatches = findMatchingHookCommands(matchers, "Grep", {});
+  assert.equal(grepMatches.length, 0);
+});
+
+runTest("findMatchingHookCommands supports wildcard matchers", () => {
+  const matchers: PreToolUseHookMatcher[] = [
+    hookMatcher(".*", [{ type: "command", command: "echo all" }]),
+    hookMatcher("mcp__exa__.*", [{ type: "command", command: "echo exa" }]),
+  ];
+
+  const bashMatches = findMatchingHookCommands(matchers, "Bash", {});
+  assert.equal(bashMatches.length, 1);
+  assert.equal(bashMatches[0].command, "echo all");
+
+  const exaMatches = findMatchingHookCommands(matchers, "mcp__exa__search", {});
+  assert.equal(exaMatches.length, 2);
+});
+
+runTest("findMatchingHookCommands filters by if field", () => {
+  const matchers: PreToolUseHookMatcher[] = [
+    hookMatcher("Bash", [
+      { type: "command", if: "Bash(rm *)", command: "echo block-rm" },
+      { type: "command", command: "echo allow-all" },
+    ]),
+  ];
+
+  const rmMatches = findMatchingHookCommands(matchers, "Bash", { command: "rm -rf /tmp" });
+  assert.equal(rmMatches.length, 2);
+  assert.equal(rmMatches[0].command, "echo block-rm");
+  assert.equal(rmMatches[1].command, "echo allow-all");
+
+  const lsMatches = findMatchingHookCommands(matchers, "Bash", { command: "ls" });
+  assert.equal(lsMatches.length, 1);
+  assert.equal(lsMatches[0].command, "echo allow-all");
+});
+
+runTest("findMatchingHookCommands if field checks tool name match", () => {
+  const matchers: PreToolUseHookMatcher[] = [
+    hookMatcher(".*", [
+      { type: "command", if: "Bash(rm *)", command: "echo block-rm" },
+    ]),
+  ];
+
+  // Matcher regex matches Read, but the if field specifies Bash — should not match
+  const readMatches = findMatchingHookCommands(matchers, "Read", { path: "rm -rf" });
+  assert.equal(readMatches.length, 0);
+});
+
+runTest("findMatchingHookCommands if field works for Edit file paths", () => {
+  const matchers: PreToolUseHookMatcher[] = [
+    hookMatcher("Edit", [
+      { type: "command", if: "Edit(*.ts)", command: "echo ts-only" },
+    ]),
+  ];
+
+  const tsMatches = findMatchingHookCommands(matchers, "Edit", { file_path: "src/index.ts" });
+  assert.equal(tsMatches.length, 1);
+
+  const jsMatches = findMatchingHookCommands(matchers, "Edit", { file_path: "src/index.js" });
+  assert.equal(jsMatches.length, 0);
+});
+
+runTest("mergeHookDecisions returns defer for empty results", () => {
+  const merged = mergeHookDecisions([]);
+  assert.equal(merged.decision, "defer");
+  assert.deepEqual(merged.reasons, []);
+});
+
+runTest("mergeHookDecisions picks highest-priority decision", () => {
+  const allowAllow = mergeHookDecisions([
+    { decision: "allow", exitCode: 0, timedOut: false },
+    { decision: "allow", exitCode: 0, timedOut: false },
+  ]);
+  assert.equal(allowAllow.decision, "allow");
+
+  const allowDeny = mergeHookDecisions([
+    { decision: "allow", exitCode: 0, timedOut: false },
+    { decision: "deny", reason: "blocked", exitCode: 0, timedOut: false },
+  ]);
+  assert.equal(allowDeny.decision, "deny");
+
+  const askAllow = mergeHookDecisions([
+    { decision: "ask", reason: "needs review", exitCode: 0, timedOut: false },
+    { decision: "allow", exitCode: 0, timedOut: false },
+  ]);
+  assert.equal(askAllow.decision, "ask");
+
+  const deferAsk = mergeHookDecisions([
+    { decision: "defer", exitCode: 0, timedOut: false },
+    { decision: "ask", reason: "needs review", exitCode: 0, timedOut: false },
+  ]);
+  assert.equal(deferAsk.decision, "ask");
+});
+
+runTest("mergeHookDecisions aggregates reasons from all results", () => {
+  const merged = mergeHookDecisions([
+    { decision: "ask", reason: "reason-a", exitCode: 0, timedOut: false },
+    { decision: "deny", reason: "reason-b", exitCode: 0, timedOut: false },
+  ]);
+  assert.equal(merged.decision, "deny");
+  assert.deepEqual(merged.reasons, ["reason-a", "reason-b"]);
+});
+
+runTest("mergeHookDecisions forwards updatedInput and additionalContext from winner", () => {
+  const merged = mergeHookDecisions([
+    { decision: "deny", reason: "blocked", updatedInput: { x: 1 }, additionalContext: "ctx", exitCode: 0, timedOut: false },
+    { decision: "allow", updatedInput: { y: 2 }, exitCode: 0, timedOut: false },
+  ]);
+  assert.equal(merged.decision, "deny");
+  assert.deepEqual(merged.updatedInput, { x: 1 });
+  assert.equal(merged.additionalContext, "ctx");
+});
+
+runTest("mergeHookDecisions does not inherit updatedInput from lower-priority result", () => {
+  const merged = mergeHookDecisions([
+    { decision: "deny", reason: "blocked", exitCode: 0, timedOut: false },
+    { decision: "allow", updatedInput: { y: 2 }, additionalContext: "ignored", exitCode: 0, timedOut: false },
+  ]);
+  assert.equal(merged.decision, "deny");
+  assert.equal(merged.updatedInput, undefined);
+  assert.equal(merged.additionalContext, undefined);
+});
+
+function createTempScript(dir: string, name: string, content: string): string {
+  const scriptPath = join(dir, name);
+  writeFileSync(scriptPath, content, { mode: 0o755 });
+  return scriptPath;
+}
+
+runTest("executePreToolUseHook parses valid JSON deny output on exit 0", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "deny.sh", `#!/bin/sh
+cat <<'JSON'
+{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"blocked by policy"}}
+JSON
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "deny");
+    assert.equal(result.reason, "blocked by policy");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.timedOut, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook parses allow decision", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "allow.sh", `#!/bin/sh
+echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"safe command"}}'
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "allow");
+    assert.equal(result.reason, "safe command");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook returns deny with stderr on exit code 2", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "exit2.sh", `#!/bin/sh
+echo "danger zone" >&2
+exit 2
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "deny");
+    assert.equal(result.reason, "danger zone");
+    assert.ok(result.stderr?.includes("danger zone"));
+    assert.equal(result.exitCode, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook returns defer on non-zero non-2 exit code", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "exit1.sh", `#!/bin/sh
+exit 1
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "defer");
+    assert.equal(result.exitCode, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook returns defer on invalid JSON output", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "bad-json.sh", `#!/bin/sh
+echo "not json"
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "defer");
+    assert.equal(result.exitCode, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook returns defer on empty stdout", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "empty.sh", `#!/bin/sh
+exit 0
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "defer");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook defers on unrecognized permissionDecision value", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "maybe.sh", `#!/bin/sh
+echo '{"hookSpecificOutput":{"permissionDecision":"maybe","permissionDecisionReason":"unsure"}}'
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "defer");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook enforces timeout", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "slow.sh", `#!/bin/sh
+sleep 30
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script, timeout: 1 },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "defer");
+    assert.equal(result.timedOut, true);
+    assert.equal(result.exitCode, null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook receives tool input on stdin", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    // Script reads stdin and checks tool_name field, denies if it matches
+    const script = createTempScript(dir, "stdin-check.sh", `#!/bin/sh
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | grep -o '"tool_name":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ "$TOOL_NAME" = "Bash" ]; then
+  echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"received bash"}}'
+else
+  echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'
+fi
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "deny");
+    assert.equal(result.reason, "received bash");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook sends transcript_path in stdin JSON", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "check-transcript.sh", `#!/bin/sh
+INPUT=$(cat)
+TRANSCRIPT=$(echo "$INPUT" | grep -o '"transcript_path":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ "$TRANSCRIPT" = "/some/session/dir" ]; then
+  echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'
+else
+  echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"missing or wrong transcript_path"}}'
+fi
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "/some/session/dir" },
+    );
+    assert.equal(result.decision, "allow");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("runPreToolUseHooks propagates transcript_path to hook subprocess", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "check-ctx-transcript.sh", `#!/bin/sh
+INPUT=$(cat)
+TRANSCRIPT=$(echo "$INPUT" | grep -o '"transcript_path":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ "$TRANSCRIPT" = "/ctx/session/dir" ]; then
+  echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"transcript_path received"}}'
+else
+  echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"missing transcript_path"}}'
+fi
+`);
+    const matchers: PreToolUseHookMatcher[] = [
+      hookMatcher("Bash", [{ type: "command", command: script }]),
+    ];
+    const ctx = { session_id: "test", cwd: "/tmp", permission_mode: "default", transcript_path: "/ctx/session/dir" };
+
+    const result = await runPreToolUseHooks(matchers, "bash", { command: "ls" }, ctx, "id-1");
+    assert.equal(result.decision, "allow");
+    assert.ok(result.reasons.some((r) => r.includes("transcript_path received")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("runPreToolUseHooks returns defer when no hooks match", async () => {
+  const matchers: PreToolUseHookMatcher[] = [
+    hookMatcher("Bash", [{ type: "command", command: "echo ignored" }]),
+  ];
+
+  const result = await runPreToolUseHooks(matchers, "read", {}, {
+    session_id: "test", cwd: "/tmp", permission_mode: "default", transcript_path: "",
+  }, "test-id");
+
+  assert.equal(result.decision, "defer");
+});
+
+runTest("runPreToolUseHooks executes matching hooks end-to-end", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "deny-rm.sh", `#!/bin/sh
+INPUT=$(cat)
+CMD=$(echo "$INPUT" | grep -o '"command":"[^"]*"' | head -1 | cut -d'"' -f4)
+case "$CMD" in
+  rm*)
+    echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"rm blocked"}}'
+    ;;
+  *)
+    echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'
+    ;;
+esac
+`);
+    const matchers: PreToolUseHookMatcher[] = [
+      hookMatcher("Bash", [{ type: "command", command: script }]),
+    ];
+    const ctx = { session_id: "test", cwd: "/tmp", permission_mode: "default", transcript_path: "" };
+
+    const rmResult = await runPreToolUseHooks(matchers, "bash", { command: "rm -rf /tmp/foo" }, ctx, "id-1");
+    assert.equal(rmResult.decision, "deny");
+    assert.ok(rmResult.reasons.some((r) => r.includes("rm blocked")));
+
+    const lsResult = await runPreToolUseHooks(matchers, "bash", { command: "ls" }, ctx, "id-2");
+    assert.equal(lsResult.decision, "allow");
+
+    // Read tool should not match the Bash-only hook
+    const readResult = await runPreToolUseHooks(matchers, "read", { path: "/tmp" }, ctx, "id-3");
+    assert.equal(readResult.decision, "defer");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("PermissionManager.getHooks parses hooks from pi-permissions.jsonc", () => {
+  const { manager, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: "Bash",
+          hooks: [
+            { type: "command", command: "/usr/local/bin/check.sh", timeout: 5 },
+            { type: "command", if: "Bash(rm *)", command: "/usr/local/bin/block-rm.sh" },
+          ],
+        },
+      ],
+    },
+  });
+  try {
+    const hooks = manager.getHooks();
+    assert.ok(hooks);
+    assert.ok(hooks!.PreToolUse);
+    assert.equal(hooks!.PreToolUse!.length, 1);
+    assert.equal(hooks!.PreToolUse![0].matcher, "Bash");
+    assert.equal(hooks!.PreToolUse![0].hooks.length, 2);
+    assert.equal(hooks!.PreToolUse![0].hooks[0].timeout, 5);
+    assert.equal(hooks!.PreToolUse![0].hooks[1].if, "Bash(rm *)");
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("PermissionManager.getHooks drops invalid hook entries", () => {
+  const { manager, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+    hooks: {
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: "" }] },
+        { matcher: "", hooks: [{ type: "command", command: "echo x" }] },
+        { matcher: "Bash", hooks: [] },
+        { matcher: "Read", hooks: [{ type: "not-command", command: "echo y" }] },
+        "not-an-object",
+      ],
+    },
+  });
+  try {
+    assert.equal(manager.getHooks(), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("PermissionManager.getHooks preserves valid entries when some are invalid", () => {
+  const { manager, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+    hooks: {
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: "echo valid" }] },
+        { matcher: "", hooks: [{ type: "command", command: "echo invalid-empty-matcher" }] },
+      ],
+    },
+  });
+  try {
+    const hooks = manager.getHooks();
+    assert.ok(hooks);
+    assert.equal(hooks!.PreToolUse!.length, 1);
+    assert.equal(hooks!.PreToolUse![0].matcher, "Bash");
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("PermissionManager.getHooks rejects invalid regex in matcher", () => {
+  const { manager, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+    hooks: {
+      PreToolUse: [
+        { matcher: "[invalid", hooks: [{ type: "command", command: "echo bad" }] },
+        { matcher: "Bash", hooks: [{ type: "command", command: "echo good" }] },
+      ],
+    },
+  });
+  try {
+    const hooks = manager.getHooks();
+    assert.ok(hooks);
+    assert.equal(hooks!.PreToolUse!.length, 1);
+    assert.equal(hooks!.PreToolUse![0].matcher, "Bash");
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("PermissionManager.getHooks rejects timeout of zero", () => {
+  const { manager, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+    hooks: {
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: "echo x", timeout: 0 }] },
+      ],
+    },
+  });
+  try {
+    const hooks = manager.getHooks();
+    assert.ok(hooks);
+    assert.equal(hooks!.PreToolUse![0].hooks[0].timeout, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("PermissionManager.getHooks rejects negative timeout", () => {
+  const { manager, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+    hooks: {
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: "echo x", timeout: -1 }] },
+      ],
+    },
+  });
+  try {
+    const hooks = manager.getHooks();
+    assert.ok(hooks);
+    assert.equal(hooks!.PreToolUse![0].hooks[0].timeout, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("PermissionManager.getHooks rejects non-numeric timeout", () => {
+  const { manager, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+    hooks: {
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: "echo x", timeout: "5" }] },
+      ],
+    },
+  });
+  try {
+    const hooks = manager.getHooks();
+    assert.ok(hooks);
+    assert.equal(hooks!.PreToolUse![0].hooks[0].timeout, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("findMatchingHookCommands skips hooks with malformed if fields", () => {
+  const matchers: PreToolUseHookMatcher[] = [
+    hookMatcher("Bash", [
+      { type: "command", if: "NoParen", command: "echo bad" },
+      { type: "command", if: "()", command: "echo bad2" },
+      { type: "command", command: "echo good" },
+    ]),
+  ];
+  const result = findMatchingHookCommands(matchers, "Bash", { command: "ls" });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].command, "echo good");
+});
+
+runTest("piToolNameToClaudeCode handles MCP colon boundary cases", () => {
+  assert.equal(piToolNameToClaudeCode("mcp", { tool: ":search" }), "mcp");
+  assert.equal(piToolNameToClaudeCode("mcp", { tool: "exa:" }), "mcp");
+  assert.equal(piToolNameToClaudeCode("mcp", { tool: ":" }), "mcp");
+});
+
+runTest("executePreToolUseHook uses fallback reason when stderr is empty on exit 2", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "exit2-no-stderr.sh", `#!/bin/sh
+exit 2
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "deny");
+    assert.equal(result.reason, "Hook blocked this tool call (exit code 2)");
+    assert.equal(result.exitCode, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("executePreToolUseHook defers when command does not exist", async () => {
+  const result = await executePreToolUseHook(
+    { type: "command", command: "/nonexistent/path/to/hook-that-does-not-exist.sh" },
+    { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+  );
+  assert.equal(result.decision, "defer");
+  assert.equal(result.timedOut, false);
+  assert.notEqual(result.exitCode, 0);
+});
+
+runTest("executePreToolUseHook parses updatedInput and additionalContext fields", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "modified.sh", `#!/bin/sh
+echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"safe-cmd"},"additionalContext":"extra info"}}'
+`);
+    const result = await executePreToolUseHook(
+      { type: "command", command: script },
+      { session_id: "test", cwd: "/tmp", permission_mode: "default", hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, tool_use_id: "test-id", transcript_path: "" },
+    );
+    assert.equal(result.decision, "allow");
+    assert.deepEqual(result.updatedInput, { command: "safe-cmd" });
+    assert.equal(result.additionalContext, "extra info");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("runPreToolUseHooks merges conflicting decisions from multiple hooks", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const allowScript = createTempScript(dir, "allow.sh", `#!/bin/sh
+echo '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"looks safe"}}'
+`);
+    const denyScript = createTempScript(dir, "deny.sh", `#!/bin/sh
+echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"blocked by audit"}}'
+`);
+    const matchers: PreToolUseHookMatcher[] = [
+      hookMatcher("Bash", [
+        { type: "command", command: allowScript },
+        { type: "command", command: denyScript },
+      ]),
+    ];
+    const ctx = { session_id: "test", cwd: "/tmp", permission_mode: "default", transcript_path: "" };
+    const result = await runPreToolUseHooks(matchers, "bash", { command: "ls" }, ctx, "id-1");
+    assert.equal(result.decision, "deny");
+    assert.ok(result.reasons.some((r) => r.includes("blocked by audit")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("runPreToolUseHooks forwards updatedInput and additionalContext from hook", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hook-test-"));
+  try {
+    const script = createTempScript(dir, "modify.sh", `#!/bin/sh
+echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"safe"},"additionalContext":"extra"}}'
+`);
+    const matchers: PreToolUseHookMatcher[] = [
+      hookMatcher("Bash", [{ type: "command", command: script }]),
+    ];
+    const ctx = { session_id: "test", cwd: "/tmp", permission_mode: "default", transcript_path: "" };
+    const result = await runPreToolUseHooks(matchers, "bash", { command: "ls" }, ctx, "id-1");
+    assert.equal(result.decision, "allow");
+    assert.deepEqual(result.updatedInput, { command: "safe" });
+    assert.equal(result.additionalContext, "extra");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+runTest("PermissionManager.getHooks returns undefined when no hooks configured", () => {
+  const { manager, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+  });
+  try {
+    assert.equal(manager.getHooks(), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("PermissionManager.getHooks invalidates cache when file changes", () => {
+  const { manager, configPath, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+    hooks: {
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: "echo first" }] },
+      ],
+    },
+  });
+  try {
+    const first = manager.getHooks();
+    assert.ok(first);
+    assert.equal(first!.PreToolUse![0].hooks[0].command, "echo first");
+
+    writeFileSync(configPath, JSON.stringify({
+      defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+      hooks: {
+        PreToolUse: [
+          { matcher: "Read", hooks: [{ type: "command", command: "echo second" }] },
+        ],
+      },
+    }, null, 2) + "\n", "utf8");
+
+    const second = manager.getHooks();
+    assert.ok(second);
+    assert.equal(second!.PreToolUse![0].matcher, "Read");
+    assert.equal(second!.PreToolUse![0].hooks[0].command, "echo second");
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("PermissionManager.getHooks returns undefined for corrupt config file", () => {
+  const { manager, configPath, cleanup } = createManagerFromRaw({
+    defaultPolicy: { tools: "ask", bash: "ask", mcp: "ask", skills: "ask", special: "ask" },
+  });
+  try {
+    writeFileSync(configPath, "this is not valid json {{{", "utf8");
+    assert.equal(manager.getHooks(), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+runTest("PermissionManager.getHooks parses hooks with JSONC comments", () => {
+  const baseDir = mkdtempSync(join(tmpdir(), "pi-permission-system-test-"));
+  const globalConfigPath = join(baseDir, "pi-permissions.jsonc");
+  const agentsDir = join(baseDir, "agents");
+  mkdirSync(agentsDir, { recursive: true });
+
+  writeFileSync(globalConfigPath, `{
+  "defaultPolicy": { "tools": "ask", "bash": "ask", "mcp": "ask", "skills": "ask", "special": "ask" },
+  // Hook configuration
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        /* block dangerous commands */
+        "hooks": [{ "type": "command", "command": "echo guarded" }]
+      }
+    ]
+  }
+}
+`, "utf8");
+
+  const manager = new PermissionManager({ globalConfigPath, agentsDir });
+  try {
+    const hooks = manager.getHooks();
+    assert.ok(hooks);
+    assert.equal(hooks!.PreToolUse![0].matcher, "Bash");
+    assert.equal(hooks!.PreToolUse![0].hooks[0].command, "echo guarded");
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+await Promise.all(pendingAsyncTests);
 console.log("All permission system tests passed.");

@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { BashFilter } from "./bash-filter.js";
 import { extractFrontmatter, getNonEmptyString, isPermissionState, parseSimpleYamlMap, toRecord } from "./common.js";
+import type { HooksConfig, PreToolUseHookCommand, PreToolUseHookMatcher } from "./hook-types.js";
 import type {
   AgentPermissions,
   BashPermissions,
@@ -115,6 +116,67 @@ function stripJsonComments(input: string): string {
   }
 
   return output;
+}
+
+function normalizeHookCommand(raw: unknown): PreToolUseHookCommand | null {
+  const record = toRecord(raw);
+  if (record.type !== "command" || typeof record.command !== "string" || !record.command.trim()) {
+    return null;
+  }
+  const result: PreToolUseHookCommand = { type: "command", command: record.command.trim() };
+  if (typeof record.if === "string" && record.if.trim()) {
+    result.if = record.if.trim();
+  }
+  if (typeof record.timeout === "number" && record.timeout > 0) {
+    result.timeout = record.timeout;
+  }
+  return result;
+}
+
+function normalizeHookMatcher(raw: unknown): PreToolUseHookMatcher | null {
+  const record = toRecord(raw);
+  if (typeof record.matcher !== "string" || !record.matcher.trim()) {
+    return null;
+  }
+  let matcherRegex: RegExp;
+  try {
+    matcherRegex = new RegExp(`^(?:${record.matcher.trim()})$`);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(record.hooks)) {
+    return null;
+  }
+  const hooks: PreToolUseHookCommand[] = [];
+  for (const hookRaw of record.hooks) {
+    const hook = normalizeHookCommand(hookRaw);
+    if (hook) {
+      hooks.push(hook);
+    }
+  }
+  if (hooks.length === 0) {
+    return null;
+  }
+  return { matcher: record.matcher.trim(), matcherRegex, hooks };
+}
+
+function normalizeHooksConfig(raw: unknown): HooksConfig | undefined {
+  const record = toRecord(raw);
+  const preToolUseRaw = record.PreToolUse;
+  if (!Array.isArray(preToolUseRaw)) {
+    return undefined;
+  }
+  const matchers: PreToolUseHookMatcher[] = [];
+  for (const matcherRaw of preToolUseRaw) {
+    const matcher = normalizeHookMatcher(matcherRaw);
+    if (matcher) {
+      matchers.push(matcher);
+    }
+  }
+  if (matchers.length === 0) {
+    return undefined;
+  }
+  return { PreToolUse: matchers };
 }
 
 function normalizePolicy(value: unknown): PermissionDefaultPolicy {
@@ -427,7 +489,7 @@ export class PermissionManager {
   private readonly legacyGlobalSettingsPath: string;
   private readonly globalMcpConfigPath: string;
   private readonly configuredMcpServerNamesOverride: readonly string[] | null;
-  private globalConfigCache: FileCacheEntry<GlobalPermissionConfig> | null = null;
+  private globalConfigCache: (FileCacheEntry<GlobalPermissionConfig> & { hooks?: HooksConfig }) | null = null;
   private readonly agentConfigCache = new Map<string, FileCacheEntry<AgentPermissions>>();
   private readonly resolvedPermissionsCache = new Map<string, FileCacheEntry<ResolvedPermissions>>();
   private configuredMcpServerNamesCache: FileCacheEntry<readonly string[]> | null = null;
@@ -457,10 +519,13 @@ export class PermissionManager {
     }
 
     let value: GlobalPermissionConfig;
+    let hooks: HooksConfig | undefined;
     try {
       const raw = readFileSync(this.globalConfigPath, "utf-8");
       const parsed = JSON.parse(stripJsonComments(raw)) as unknown;
       const normalized = normalizeRawPermission(parsed);
+      const record = toRecord(parsed);
+      hooks = normalizeHooksConfig(record.hooks);
 
       value = {
         defaultPolicy: normalizePolicy(normalized.defaultPolicy),
@@ -472,10 +537,16 @@ export class PermissionManager {
       };
     } catch {
       value = EMPTY_GLOBAL_CONFIG;
+      hooks = undefined;
     }
 
-    this.globalConfigCache = { stamp, value };
+    this.globalConfigCache = { stamp, value, hooks };
     return value;
+  }
+
+  getHooks(): HooksConfig | undefined {
+    this.loadGlobalConfig();
+    return this.globalConfigCache?.hooks;
   }
 
   private loadAgentPermissions(agentName?: string): AgentPermissions {

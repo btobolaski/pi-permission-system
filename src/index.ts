@@ -29,6 +29,8 @@ import { PermissionManager } from "./permission-manager.js";
 import { sanitizeAvailableToolsSection } from "./system-prompt-sanitizer.js";
 import { checkRequestedToolRegistration, getToolNameFromValue } from "./tool-registry.js";
 import type { PermissionCheckResult, PermissionState } from "./types.js";
+import { runPreToolUseHooks } from "./hook-runner.js";
+import type { HookExecutionContext } from "./hook-types.js";
 import { PERMISSION_SYSTEM_STATUS_KEY, syncPermissionSystemStatus } from "./status.js";
 import { canResolveAskPermissionRequest, shouldAutoApprovePermissionState } from "./yolo-mode.js";
 
@@ -1343,7 +1345,75 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       return { block: true, reason: formatDenyReason(check, agentName ?? undefined) };
     }
 
-    if (check.state === "ask") {
+    // Run PreToolUse hooks (if configured) before prompting or allowing
+    let effectiveState = check.state;
+    const preToolUseHooks = permissionManager.getHooks()?.PreToolUse;
+    if (preToolUseHooks && preToolUseHooks.length > 0) {
+      const hookContext: HookExecutionContext = {
+        session_id: getSessionId(ctx),
+        cwd: ctx.cwd,
+        permission_mode: extensionConfig.yoloMode ? "yolo" : "default",
+        transcript_path: ctx.sessionManager.getSessionDir() || "",
+      };
+
+      const hookDecision = await runPreToolUseHooks(
+        preToolUseHooks,
+        toolName,
+        input,
+        hookContext,
+        event.toolCallId ?? "",
+      );
+
+      if (hookDecision.decision !== "defer") {
+        writeDebugLog("hook.pretooluse_result", {
+          toolName,
+          originalState: check.state,
+          hookDecision: hookDecision.decision,
+          hookReasons: hookDecision.reasons,
+        });
+
+        // Pi's tool_call hook return type is { block: true, reason } | {} — there is no
+        // mechanism to pass modified input or context back to the agent runtime. We log
+        // these fields for debugging but cannot apply them.
+        if (hookDecision.updatedInput !== undefined) {
+          writeDebugLog("hook.updated_input_not_supported", {
+            toolName,
+            updatedInput: hookDecision.updatedInput,
+          });
+        }
+
+        if (hookDecision.additionalContext !== undefined) {
+          writeDebugLog("hook.additional_context_not_supported", {
+            toolName,
+            additionalContext: hookDecision.additionalContext,
+          });
+        }
+
+        if (hookDecision.decision === "deny") {
+          const reason = hookDecision.reasons.length > 0
+            ? hookDecision.reasons.join("; ")
+            : "Blocked by PreToolUse hook";
+          writeReviewLog("permission_request.blocked", {
+            source: "pretooluse_hook",
+            toolCallId: event.toolCallId,
+            toolName,
+            agentName,
+            ...permissionLogContext,
+            resolution: "hook_denied",
+            hookReasons: hookDecision.reasons,
+          });
+          return { block: true, reason };
+        }
+
+        if (hookDecision.decision === "allow") {
+          effectiveState = "allow";
+        } else if (hookDecision.decision === "ask") {
+          effectiveState = "ask";
+        }
+      }
+    }
+
+    if (effectiveState === "ask") {
       const unavailableReason = toolName === "bash" && isToolCallEventType("bash", event)
         ? `Running bash command '${event.input.command}' requires approval, but no interactive UI is available.`
         : toolName === "mcp"

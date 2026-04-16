@@ -18,6 +18,7 @@ Permission enforcement extension for the Pi coding agent that provides centraliz
 - **Skill Protection** — Controls which skills can be loaded or read from disk
 - **Per-Agent Overrides** — Agent-specific permission policies via YAML frontmatter
 - **Subagent Permission Forwarding** — Forwards `ask` confirmations from non-UI subagents back to the main interactive session
+- **PreToolUse Hooks** — Execute external shell commands before tool calls, using the same protocol as [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks)
 - **File-Based Review Logging** — Writes permission request/denial review entries to a file by default for later auditing
 - **Optional Debug Logging** — Keeps verbose extension diagnostics in a separate file when enabled in `config.json`
 - **JSON Schema Validation** — Full schema for editor autocomplete and config validation
@@ -95,7 +96,9 @@ The extension creates this file automatically when it is missing. It controls on
 ```json
 {
   "debugLog": false,
-  "permissionReviewLog": true
+  "permissionReviewLog": true,
+  "yoloMode": false,
+  "hooks": {}
 }
 ```
 
@@ -103,8 +106,214 @@ The extension creates this file automatically when it is missing. It controls on
 |-----|---------|-------------|
 | `debugLog` | `false` | Enables verbose diagnostic logging to `logs/pi-permission-system-debug.jsonl` |
 | `permissionReviewLog` | `true` | Enables the permission request/denial review log at `logs/pi-permission-system-permission-review.jsonl` |
+| `yoloMode` | `false` | Auto-approve all `ask` permissions without prompting |
+| `hooks` | `{}` | PreToolUse hook configuration (see [PreToolUse Hooks](#pretooluse-hooks) below) |
 
 Both logs write to files only under the extension directory. No debug output is printed to the terminal.
+
+### PreToolUse Hooks
+
+PreToolUse hooks let you run external shell commands before each tool call. They use the same protocol as [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks), so scripts written for Claude Code work here without modification.
+
+#### When Hooks Run
+
+Hooks execute **after** the internal permission policy check but **before** any user confirmation prompt:
+
+```
+tool_call event
+  → permissionManager.checkPermission()
+  → if deny: block (hooks never run)
+  → if allow or ask: run PreToolUse hooks
+    → hook decision overrides the original state
+  → if ask: prompt user
+  → if allow: proceed
+```
+
+This means hooks can:
+- **Escalate** `allow` to `deny` or `ask` (security hooks inspecting command content)
+- **Resolve** `ask` to `allow` or `deny` (auto-approval or auto-denial)
+- **Defer** to the original permission decision (no opinion)
+
+#### Configuration
+
+Add a `hooks` section to your extension config at `~/.pi/agent/extensions/pi-permission-system/config.json`:
+
+```jsonc
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(rm *)",
+            "command": "/path/to/block-rm.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/audit-log.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Each entry in `PreToolUse` has:
+
+| Field | Description |
+|-------|-------------|
+| `matcher` | Regex pattern tested against the Claude Code-style tool name (e.g., `"Bash"`, `"Read\|Write"`, `"mcp__exa__.*"`, `".*"`) |
+| `hooks` | Array of hook commands to run when the matcher matches |
+
+Each hook command has:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `type` | Yes | — | Must be `"command"` |
+| `command` | Yes | — | Shell command to execute (run via `sh -c`) |
+| `if` | No | — | Additional filter in `ToolName(pattern)` format (e.g., `Bash(rm *)`, `Edit(*.ts)`) |
+| `timeout` | No | `10` | Maximum execution time in seconds |
+
+#### Tool Name Mapping
+
+Pi uses lowercase tool names internally, but hook matchers use Claude Code's naming convention:
+
+| Pi name | Claude Code name (used in `matcher` and `if`) |
+|---------|-----------------------------------------------|
+| `bash` | `Bash` |
+| `read` | `Read` |
+| `write` | `Write` |
+| `edit` | `Edit` |
+| `grep` | `Grep` |
+| `find` | `Glob` |
+| `ls` | `LS` |
+| `skill` | `Skill` |
+| `mcp` | `mcp__<server>__<tool>` (derived from input) |
+
+Unknown or extension-provided tool names are passed through as-is.
+
+#### The `if` Field
+
+The `if` field provides tool-specific input filtering using the format `ToolName(pattern)`:
+
+- `Bash(rm *)` — matches bash commands starting with `rm`
+- `Edit(*.ts)` — matches edits to TypeScript files
+- `Grep(src/*)` — matches grep operations in the `src/` directory
+
+The pattern uses `*`-wildcard matching (same as bash permission patterns). The tool name in the `if` field must match the current tool for the filter to apply.
+
+Input fields checked per tool:
+- **Bash** — `command`
+- **Read/Write/Edit** — `file_path` or `path`
+- **Grep** — `path` or `pattern`
+- **Glob** — `pattern`
+
+#### Hook Input (stdin)
+
+Each hook receives a JSON object on stdin:
+
+```json
+{
+  "session_id": "abc123",
+  "cwd": "/current/working/dir",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf /tmp/build"
+  },
+  "tool_use_id": "toolu_01ABC123",
+  "transcript_path": "/path/to/session/dir"
+}
+```
+
+#### Hook Output (stdout)
+
+Hooks return a JSON object on stdout:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Destructive rm command blocked by policy"
+  }
+}
+```
+
+| Field | Values | Description |
+|-------|--------|-------------|
+| `permissionDecision` | `"allow"`, `"deny"`, `"ask"`, `"defer"` | The hook's permission decision |
+| `permissionDecisionReason` | string | Human-readable reason (shown to user or agent) |
+
+#### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success — parse stdout JSON for the decision |
+| `2` | Blocking error — tool is denied, stderr shown as the reason |
+| Other | Non-blocking error — logged, treated as `defer` |
+
+#### Decision Precedence
+
+When multiple hooks match, their decisions are merged with this priority (highest wins):
+
+```
+deny (4) > ask (3) > allow (2) > defer (1)
+```
+
+If any hook returns `deny`, the final decision is `deny` regardless of other hooks.
+
+#### Known Limitations
+
+- **`updatedInput`**: Hooks may return `updatedInput` to modify tool parameters, but Pi's hook return type does not support passing modified input back. Updated input is logged at debug level but not applied.
+- **`additionalContext`**: Similarly logged but not injected into the agent context.
+- **No agent name**: Hook input does not include an agent name concept. Hooks apply to all agents equally.
+
+#### Example: Block Destructive Commands
+
+Create `~/.pi/agent/hooks/block-rm.sh`:
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
+
+if echo "$COMMAND" | grep -qE '^rm\s+(-[^ ]+\s+)*-r'; then
+  echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"Recursive rm blocked by hook"}}'
+else
+  echo '{"hookSpecificOutput":{"permissionDecision":"defer"}}'
+fi
+```
+
+Configure in `config.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.pi/agent/hooks/block-rm.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
 ### Global Policy File
 
@@ -366,6 +575,39 @@ permission:
 ---
 ```
 
+### Audit All Tool Calls via Hook
+
+In `config.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.pi/agent/hooks/audit.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`~/.pi/agent/hooks/audit.sh`:
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TOOL=$(echo "$INPUT" | jq -r '.tool_name')
+echo "$(date -Iseconds) $TOOL" >> ~/.pi/agent/audit.log
+# Defer to the normal permission system
+echo '{"hookSpecificOutput":{"permissionDecision":"defer"}}'
+```
+
 ---
 
 ## Technical Details
@@ -400,6 +642,10 @@ src/
 ├── wildcard-matcher.ts     → Shared wildcard pattern compilation and matching
 ├── common.ts               → Shared utilities (YAML parsing, type guards, etc.)
 ├── tool-registry.ts        → Registered tool name resolution
+├── hook-types.ts           → PreToolUse hook type definitions
+├── hook-matcher.ts         → Tool name mapping (Pi ↔ Claude Code) and hook matching
+├── hook-executor.ts        → Subprocess execution engine for hook commands
+├── hook-runner.ts          → Hook orchestration: match, execute, merge decisions
 ├── types.ts                → TypeScript type definitions
 └── test.ts                 → Test runner
 schemas/
@@ -418,6 +664,10 @@ The extension uses a modular architecture with shared utilities:
 | `wildcard-matcher.ts` | Compile-once wildcard patterns with specificity sorting: `compileWildcardPatterns()`, `findCompiledWildcardMatch()` |
 | `permission-manager.ts` | Policy resolution with file stamp caching for performance |
 | `bash-filter.ts` | Uses shared wildcard matcher for bash command patterns |
+| `hook-types.ts` | Type definitions for hook configuration, I/O protocol, and results |
+| `hook-matcher.ts` | Pi ↔ Claude Code tool name mapping, regex matcher, `if` field parsing |
+| `hook-executor.ts` | Subprocess execution: spawn, stdin/stdout, timeout, exit code handling |
+| `hook-runner.ts` | Hook orchestration: find matching hooks, execute sequentially, merge decisions |
 
 #### Performance Optimizations
 
