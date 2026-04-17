@@ -22,6 +22,7 @@ export type ForwardedPermissionResponse = {
   approved: boolean;
   responderSessionId: string;
   respondedAt: number;
+  denialReason?: string;
 };
 
 export type PermissionForwardingLocation = {

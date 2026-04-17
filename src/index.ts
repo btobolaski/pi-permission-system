@@ -33,6 +33,11 @@ import { runPreToolUseHooks } from "./hook-runner.js";
 import type { HookExecutionContext } from "./hook-types.js";
 import { PERMISSION_SYSTEM_STATUS_KEY, syncPermissionSystemStatus } from "./status.js";
 import { canResolveAskPermissionRequest, shouldAutoApprovePermissionState } from "./yolo-mode.js";
+import {
+  createDeniedPermissionDecision,
+  requestPermissionDecisionFromUi,
+  type PermissionPromptDecision,
+} from "./permission-dialog.js";
 
 const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
 const SESSIONS_DIR = join(PI_AGENT_DIR, "sessions");
@@ -77,6 +82,7 @@ type PermissionRequestEvent = {
   command?: string;
   target?: string;
   agentName?: string | null;
+  denialReason?: string;
 };
 
 const PERMISSION_REQUEST_EVENT_CHANNEL = "pi-permission-system:permission-request";
@@ -411,14 +417,15 @@ function formatDenyReason(result: PermissionCheckResult, agentName?: string): st
   return `${parts.join(" ")}. ${formatPermissionHardStopHint(result)}`;
 }
 
-function formatUserDeniedReason(result: PermissionCheckResult): string {
+function formatUserDeniedReason(result: PermissionCheckResult, denialReason?: string): string {
   const base = (result.source === "mcp" || result.toolName === "mcp") && result.target
     ? `User denied MCP target '${result.target}'.`
     : result.toolName === "bash" && result.command
       ? `User denied bash command '${result.command}'.`
       : `User denied tool '${result.toolName}'.`;
 
-  return `${base} ${formatPermissionHardStopHint(result)}`;
+  const reasonSuffix = denialReason ? ` Reason: ${denialReason}` : "";
+  return `${base}${reasonSuffix} ${formatPermissionHardStopHint(result)}`;
 }
 
 function formatAskPrompt(result: PermissionCheckResult, agentName?: string): string {
@@ -681,6 +688,7 @@ function readForwardedPermissionResponse(filePath: string): ForwardedPermissionR
       approved: parsed.approved,
       responderSessionId: parsed.responderSessionId,
       respondedAt: typeof parsed.respondedAt === "number" ? parsed.respondedAt : Date.now(),
+      denialReason: typeof parsed.denialReason === "string" ? parsed.denialReason : undefined,
     };
   } catch (error) {
     logPermissionForwardingWarning(`Failed to read forwarded permission response '${filePath}'`, error);
@@ -699,7 +707,7 @@ function formatForwardedPermissionPrompt(request: ForwardedPermissionRequest): s
   ].join("\n");
 }
 
-async function waitForForwardedPermissionApproval(ctx: ExtensionContext, message: string): Promise<boolean> {
+async function waitForForwardedPermissionApproval(ctx: ExtensionContext, message: string): Promise<PermissionPromptDecision> {
   const requesterSessionId = getSessionId(ctx);
   const targetSessionId = resolvePermissionForwardingTargetSessionId({
     hasUI: ctx.hasUI,
@@ -712,7 +720,7 @@ async function waitForForwardedPermissionApproval(ctx: ExtensionContext, message
     logPermissionForwardingError(
       "Permission forwarding target session could not be resolved from subagent runtime metadata (expected PI_AGENT_ROUTER_PARENT_SESSION_ID)",
     );
-    return false;
+    return createDeniedPermissionDecision();
   }
 
   const location = ensurePermissionForwardingLocation(targetSessionId);
@@ -720,7 +728,7 @@ async function waitForForwardedPermissionApproval(ctx: ExtensionContext, message
     logPermissionForwardingError(
       `Permission forwarding is unavailable because session-scoped directories could not be prepared for '${targetSessionId}'`,
     );
-    return false;
+    return createDeniedPermissionDecision();
   }
 
   const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${process.pid}`;
@@ -750,7 +758,7 @@ async function waitForForwardedPermissionApproval(ctx: ExtensionContext, message
     writeJsonFileAtomic(requestPath, request);
   } catch (error) {
     logPermissionForwardingError(`Failed to write forwarded permission request '${requestPath}'`, error);
-    return false;
+    return createDeniedPermissionDecision();
   }
 
   const deadline = Date.now() + PERMISSION_FORWARDING_TIMEOUT_MS;
@@ -763,11 +771,15 @@ async function waitForForwardedPermissionApproval(ctx: ExtensionContext, message
         responderSessionId: response?.responderSessionId ?? null,
         targetSessionId,
         responsePath,
+        denialReason: response?.denialReason ?? null,
       });
       safeDeleteFile(responsePath, "forwarded permission response");
       safeDeleteFile(requestPath, "forwarded permission request");
       cleanupPermissionForwardingLocationIfEmpty(location);
-      return Boolean(response?.approved);
+      if (response?.approved) {
+        return { approved: true, state: "approved" };
+      }
+      return createDeniedPermissionDecision(response?.denialReason);
     }
 
     await sleep(PERMISSION_FORWARDING_POLL_INTERVAL_MS);
@@ -782,7 +794,7 @@ async function waitForForwardedPermissionApproval(ctx: ExtensionContext, message
   });
   safeDeleteFile(requestPath, "forwarded permission request");
   cleanupPermissionForwardingLocationIfEmpty(location);
-  return false;
+  return createDeniedPermissionDecision();
 }
 
 async function processForwardedPermissionRequests(ctx: ExtensionContext): Promise<void> {
@@ -831,34 +843,40 @@ async function processForwardedPermissionRequests(ctx: ExtensionContext): Promis
       requestPath,
     };
 
-    let approved = false;
+    let decision: PermissionPromptDecision;
     if (shouldAutoApprovePermissionState("ask", extensionConfig)) {
       writeReviewLog("forwarded_permission.auto_approved", forwardedPermissionLogDetails);
-      approved = true;
+      decision = { approved: true, state: "approved" };
     } else {
       writeReviewLog("forwarded_permission.prompted", forwardedPermissionLogDetails);
       try {
-        approved = await ctx.ui.confirm("Permission Required (Subagent)", formatForwardedPermissionPrompt(request));
+        decision = await requestPermissionDecisionFromUi(
+          ctx.ui,
+          "Permission Required (Subagent)",
+          formatForwardedPermissionPrompt(request),
+        );
       } catch (error) {
         logPermissionForwardingError("Failed to show forwarded permission confirmation dialog", error);
-        approved = false;
+        decision = createDeniedPermissionDecision();
       }
     }
 
     const responsePath = join(location.responsesDir, `${request.id}.json`);
-    writeReviewLog(approved ? "forwarded_permission.approved" : "forwarded_permission.denied", {
+    writeReviewLog(decision.approved ? "forwarded_permission.approved" : "forwarded_permission.denied", {
       requestId: request.id,
       source: location.label,
       requesterAgentName: request.requesterAgentName,
       requesterSessionId: request.requesterSessionId,
       targetSessionId: request.targetSessionId,
       responsePath,
+      denialReason: decision.denialReason ?? null,
     });
     try {
       writeJsonFileAtomic(responsePath, {
-        approved,
+        approved: decision.approved,
         responderSessionId: currentSessionId,
         respondedAt: Date.now(),
+        denialReason: decision.denialReason,
       } satisfies ForwardedPermissionResponse);
     } catch (error) {
       logPermissionForwardingError(`Failed to write ${location.label} forwarded permission response '${responsePath}'`, error);
@@ -871,13 +889,13 @@ async function processForwardedPermissionRequests(ctx: ExtensionContext): Promis
   cleanupPermissionForwardingLocationIfEmpty(location);
 }
 
-async function confirmPermission(ctx: ExtensionContext, message: string): Promise<boolean> {
+async function confirmPermission(ctx: ExtensionContext, message: string): Promise<PermissionPromptDecision> {
   if (ctx.hasUI) {
-    return ctx.ui.confirm("Permission Required", message);
+    return requestPermissionDecisionFromUi(ctx.ui, "Permission Required", message);
   }
 
   if (!isSubagentExecutionContext(ctx)) {
-    return false;
+    return createDeniedPermissionDecision();
   }
 
   return waitForForwardedPermissionApproval(ctx, message);
@@ -990,6 +1008,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       command?: string;
       target?: string;
       resolution?: string;
+      denialReason?: string;
     },
   ): void => {
     writeReviewLog(event, {
@@ -1004,6 +1023,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       command: details.command ?? null,
       target: details.target ?? null,
       resolution: details.resolution ?? null,
+      denialReason: details.denialReason ?? null,
     });
   };
 
@@ -1021,7 +1041,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       command?: string;
       target?: string;
     },
-  ): Promise<boolean> => {
+  ): Promise<PermissionPromptDecision> => {
     if (shouldAutoApprovePermissionState("ask", extensionConfig)) {
       reviewPermissionDecision("permission_request.auto_approved", details);
       emitPermissionRequestEvent({
@@ -1037,7 +1057,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
         target: details.target,
         agentName: details.agentName,
       });
-      return true;
+      return { approved: true, state: "approved" };
     }
 
     reviewPermissionDecision("permission_request.waiting", details);
@@ -1055,12 +1075,15 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       agentName: details.agentName,
     });
 
-    const approved = await confirmPermission(ctx, details.message);
-    reviewPermissionDecision(approved ? "permission_request.approved" : "permission_request.denied", details);
+    const decision = await confirmPermission(ctx, details.message);
+    reviewPermissionDecision(decision.approved ? "permission_request.approved" : "permission_request.denied", {
+      ...details,
+      denialReason: decision.denialReason,
+    });
     emitPermissionRequestEvent({
       requestId: details.requestId,
       source: details.source,
-      state: approved ? "approved" : "denied",
+      state: decision.approved ? "approved" : "denied",
       message: details.message,
       toolCallId: details.toolCallId,
       toolName: details.toolName,
@@ -1069,9 +1092,10 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       command: details.command,
       target: details.target,
       agentName: details.agentName,
+      denialReason: decision.denialReason,
     });
 
-    return approved;
+    return decision;
   };
 
   const stopForwardedPermissionPolling = (): void => {
@@ -1239,14 +1263,17 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
         return { action: "handled" };
       }
 
-      const approved = await promptPermission(ctx, {
+      const decision = await promptPermission(ctx, {
         requestId: createPermissionRequestId("skill-input"),
         source: "skill_input",
         agentName,
         message,
         skillName,
       });
-      if (!approved) {
+      if (!decision.approved) {
+        // The input hook return type only supports { action: "handled" } with no reason
+        // field, so decision.denialReason cannot be surfaced to the agent here. It is
+        // still recorded in the review log and emitted event via promptPermission.
         return { action: "handled" };
       }
     }
@@ -1312,7 +1339,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
             };
           }
 
-          const approved = await promptPermission(ctx, {
+          const decision = await promptPermission(ctx, {
             requestId: event.toolCallId,
             source: "skill_read",
             agentName,
@@ -1322,8 +1349,9 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
             skillName: matchedSkill.name,
             path: event.input.path,
           });
-          if (!approved) {
-            return { block: true, reason: `User denied access to skill '${matchedSkill.name}'.` };
+          if (!decision.approved) {
+            const reasonSuffix = decision.denialReason ? ` Reason: ${decision.denialReason}` : "";
+            return { block: true, reason: `User denied access to skill '${matchedSkill.name}'.${reasonSuffix}` };
           }
         }
       }
@@ -1372,9 +1400,10 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
           hookReasons: hookDecision.reasons,
         });
 
-        // Pi's tool_call hook return type is { block: true, reason } | {} — there is no
-        // mechanism to pass modified input or context back to the agent runtime. We log
-        // these fields for debugging but cannot apply them.
+        // Pi's tool_call hook return type is { block: true, reason } | {} — the `reason`
+        // field IS supported and passed to the agent, but there is no mechanism to pass
+        // modified input or additional context back to the agent runtime. We log those
+        // fields for debugging but cannot apply them.
         if (hookDecision.updatedInput !== undefined) {
           writeDebugLog("hook.updated_input_not_supported", {
             toolName,
@@ -1437,7 +1466,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
         };
       }
 
-      const approved = await promptPermission(ctx, {
+      const decision = await promptPermission(ctx, {
         requestId: event.toolCallId,
         source: "tool_call",
         agentName,
@@ -1446,8 +1475,8 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
         toolName,
         ...permissionLogContext,
       });
-      if (!approved) {
-        return { block: true, reason: formatUserDeniedReason(check) };
+      if (!decision.approved) {
+        return { block: true, reason: formatUserDeniedReason(check, decision.denialReason) };
       }
     }
 

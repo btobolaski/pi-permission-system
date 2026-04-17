@@ -21,6 +21,13 @@ import { getPermissionSystemStatus } from "./status.js";
 import { sanitizeAvailableToolsSection } from "./system-prompt-sanitizer.js";
 import type { GlobalPermissionConfig } from "./types.js";
 import { canResolveAskPermissionRequest, shouldAutoApprovePermissionState } from "./yolo-mode.js";
+import {
+  normalizePermissionDenialReason,
+  createDeniedPermissionDecision,
+  isPermissionDecisionState,
+  requestPermissionDecisionFromUi,
+  type PermissionDecisionUi,
+} from "./permission-dialog.js";
 
 type CreateManagerOptions = {
   mcpServerNames?: readonly string[];
@@ -1836,6 +1843,120 @@ runTest("PermissionManager.getHooks parses hooks with JSONC comments", () => {
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
   }
+});
+
+// --- Permission dialog tests ---
+
+runTest("normalizePermissionDenialReason returns undefined for non-string inputs", () => {
+  assert.equal(normalizePermissionDenialReason(undefined), undefined);
+  assert.equal(normalizePermissionDenialReason(null), undefined);
+  assert.equal(normalizePermissionDenialReason(42), undefined);
+  assert.equal(normalizePermissionDenialReason({}), undefined);
+});
+
+runTest("normalizePermissionDenialReason returns undefined for empty and whitespace-only strings", () => {
+  assert.equal(normalizePermissionDenialReason(""), undefined);
+  assert.equal(normalizePermissionDenialReason("   "), undefined);
+  assert.equal(normalizePermissionDenialReason("\t\n"), undefined);
+});
+
+runTest("normalizePermissionDenialReason trims and returns non-empty strings", () => {
+  assert.equal(normalizePermissionDenialReason("reason"), "reason");
+  assert.equal(normalizePermissionDenialReason("  reason  "), "reason");
+});
+
+runTest("createDeniedPermissionDecision returns plain denied when no reason given", () => {
+  const result = createDeniedPermissionDecision();
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied");
+  assert.equal(result.denialReason, undefined);
+});
+
+runTest("createDeniedPermissionDecision returns plain denied for empty reason", () => {
+  const result = createDeniedPermissionDecision("");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied");
+  assert.equal(result.denialReason, undefined);
+});
+
+runTest("createDeniedPermissionDecision returns denied_with_reason for non-empty reason", () => {
+  const result = createDeniedPermissionDecision("too risky");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied_with_reason");
+  assert.equal(result.denialReason, "too risky");
+});
+
+runTest("createDeniedPermissionDecision normalizes whitespace-only reason to plain denied", () => {
+  const result = createDeniedPermissionDecision("   ");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied");
+  assert.equal(result.denialReason, undefined);
+});
+
+runTest("isPermissionDecisionState accepts valid states", () => {
+  assert.equal(isPermissionDecisionState("approved"), true);
+  assert.equal(isPermissionDecisionState("denied"), true);
+  assert.equal(isPermissionDecisionState("denied_with_reason"), true);
+});
+
+runTest("isPermissionDecisionState rejects invalid values", () => {
+  assert.equal(isPermissionDecisionState("unknown"), false);
+  assert.equal(isPermissionDecisionState(""), false);
+  assert.equal(isPermissionDecisionState(null), false);
+  assert.equal(isPermissionDecisionState(undefined), false);
+});
+
+runTest("requestPermissionDecisionFromUi returns approved when user selects Yes", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => "Yes",
+    input: async () => { throw new Error("should not be called"); },
+  };
+  const result = await requestPermissionDecisionFromUi(ui, "title", "message");
+  assert.equal(result.approved, true);
+  assert.equal(result.state, "approved");
+});
+
+runTest("requestPermissionDecisionFromUi returns denied when user selects No", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => "No",
+    input: async () => { throw new Error("should not be called"); },
+  };
+  const result = await requestPermissionDecisionFromUi(ui, "title", "message");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied");
+  assert.equal(result.denialReason, undefined);
+});
+
+runTest("requestPermissionDecisionFromUi returns denied_with_reason when user provides a reason", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => "No, provide reason",
+    input: async () => "too dangerous",
+  };
+  const result = await requestPermissionDecisionFromUi(ui, "title", "message");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied_with_reason");
+  assert.equal(result.denialReason, "too dangerous");
+});
+
+runTest("requestPermissionDecisionFromUi returns plain denied when reason input is empty", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => "No, provide reason",
+    input: async () => "",
+  };
+  const result = await requestPermissionDecisionFromUi(ui, "title", "message");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied");
+  assert.equal(result.denialReason, undefined);
+});
+
+runTest("requestPermissionDecisionFromUi returns denied when select is dismissed", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => undefined,
+    input: async () => { throw new Error("should not be called"); },
+  };
+  const result = await requestPermissionDecisionFromUi(ui, "title", "message");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied");
 });
 
 await Promise.all(pendingAsyncTests);
