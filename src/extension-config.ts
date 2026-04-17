@@ -10,6 +10,7 @@ export interface PermissionSystemExtensionConfig {
   debugLog: boolean;
   permissionReviewLog: boolean;
   yoloMode: boolean;
+  allowLocalEdits: boolean;
 }
 
 export interface PermissionSystemConfigLoadResult {
@@ -27,6 +28,7 @@ export const DEFAULT_EXTENSION_CONFIG: PermissionSystemExtensionConfig = {
   debugLog: false,
   permissionReviewLog: true,
   yoloMode: false,
+  allowLocalEdits: false,
 };
 
 export function resolveExtensionRoot(moduleUrl = import.meta.url): string {
@@ -44,6 +46,7 @@ function cloneDefaultConfig(): PermissionSystemExtensionConfig {
     debugLog: DEFAULT_EXTENSION_CONFIG.debugLog,
     permissionReviewLog: DEFAULT_EXTENSION_CONFIG.permissionReviewLog,
     yoloMode: DEFAULT_EXTENSION_CONFIG.yoloMode,
+    allowLocalEdits: DEFAULT_EXTENSION_CONFIG.allowLocalEdits,
   };
 }
 
@@ -57,6 +60,7 @@ export function normalizePermissionSystemConfig(raw: unknown): PermissionSystemE
     debugLog: record.debugLog === true,
     permissionReviewLog: record.permissionReviewLog !== false,
     yoloMode: record.yoloMode === true,
+    allowLocalEdits: record.allowLocalEdits === true,
   };
 }
 

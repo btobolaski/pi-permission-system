@@ -1,7 +1,7 @@
 import { isToolCallEventType, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, normalize, resolve, sep } from "node:path";
+import { dirname, join, normalize } from "node:path";
 
 import { toRecord } from "./common.js";
 import {
@@ -33,6 +33,7 @@ import { runPreToolUseHooks } from "./hook-runner.js";
 import type { HookExecutionContext } from "./hook-types.js";
 import { PERMISSION_SYSTEM_STATUS_KEY, syncPermissionSystemStatus } from "./status.js";
 import { canResolveAskPermissionRequest, shouldAutoApprovePermissionState } from "./yolo-mode.js";
+import { normalizePathForComparison, isPathWithinDirectory, shouldAllowLocalEdit } from "./local-edit.js";
 import {
   createDeniedPermissionDecision,
   requestPermissionDecisionFromUi,
@@ -143,37 +144,6 @@ function encodeXml(value: string): string {
     .replace(/'/g, "&apos;");
 }
 
-function normalizePathForComparison(pathValue: string, cwd: string): string {
-  const trimmed = pathValue.trim().replace(/^['"]|['"]$/g, "");
-  if (!trimmed) {
-    return "";
-  }
-
-  let normalizedPath = trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
-
-  if (normalizedPath === "~") {
-    normalizedPath = homedir();
-  } else if (normalizedPath.startsWith("~/") || normalizedPath.startsWith("~\\")) {
-    normalizedPath = join(homedir(), normalizedPath.slice(2));
-  }
-
-  const absolutePath = resolve(cwd, normalizedPath);
-  const normalizedAbsolutePath = normalize(absolutePath);
-  return process.platform === "win32" ? normalizedAbsolutePath.toLowerCase() : normalizedAbsolutePath;
-}
-
-function isPathWithinDirectory(pathValue: string, directory: string): boolean {
-  if (!pathValue || !directory) {
-    return false;
-  }
-
-  if (pathValue === directory) {
-    return true;
-  }
-
-  const prefix = directory.endsWith(sep) ? directory : `${directory}${sep}`;
-  return pathValue.startsWith(prefix);
-}
 
 function parseSkillPromptSection(prompt: string): SkillPromptSection | null {
   const start = prompt.indexOf(AVAILABLE_SKILLS_OPEN_TAG);
@@ -944,6 +914,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       debugLog: result.config.debugLog,
       permissionReviewLog: result.config.permissionReviewLog,
       yoloMode: result.config.yoloMode,
+      allowLocalEdits: result.config.allowLocalEdits,
     });
   };
 
@@ -965,6 +936,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       debugLog: normalized.debugLog,
       permissionReviewLog: normalized.permissionReviewLog,
       yoloMode: normalized.yoloMode,
+      allowLocalEdits: normalized.allowLocalEdits,
     });
   };
 
@@ -1153,7 +1125,14 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     // This ensures that agent-specific tool deny rules (e.g., bash: deny) are respected
     // before any command-level permissions are considered
     const toolPermission = permissionManager.getToolPermission(toolName, agentName ?? undefined);
-    return toolPermission !== "deny";
+    if (toolPermission !== "deny") {
+      return true;
+    }
+    // The tool_call hook resolves edit/write paths per-file at call time.
+    if (extensionConfig.allowLocalEdits && (toolName === "edit" || toolName === "write")) {
+      return true;
+    }
+    return false;
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1361,7 +1340,30 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     const check = permissionManager.checkPermission(toolName, input, agentName ?? undefined);
     const permissionLogContext = getPermissionLogContext(check);
 
-    if (check.state === "deny") {
+    // Must run before the deny block so PreToolUse hooks still get a chance to deny.
+    let effectiveCheck = check;
+    let localEditOverrideActive = false;
+    if (check.state !== "allow" && shouldAllowLocalEdit(toolName, input, ctx.cwd, extensionConfig)) {
+      const inputRecord = toRecord(input);
+      writeDebugLog("allow_local_edit.override", {
+        toolName,
+        originalState: check.state,
+        filePath: inputRecord.file_path ?? inputRecord.path,
+        cwd: ctx.cwd,
+      });
+      writeReviewLog("permission_request.local_edit_allowed", {
+        source: "tool_call",
+        toolCallId: event.toolCallId,
+        toolName,
+        agentName,
+        ...permissionLogContext,
+        resolution: "allow_local_edits",
+      });
+      effectiveCheck = { ...check, state: "allow" };
+      localEditOverrideActive = true;
+    }
+
+    if (effectiveCheck.state === "deny") {
       writeReviewLog("permission_request.blocked", {
         source: "tool_call",
         toolCallId: event.toolCallId,
@@ -1370,11 +1372,11 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
         ...permissionLogContext,
         resolution: "policy_denied",
       });
-      return { block: true, reason: formatDenyReason(check, agentName ?? undefined) };
+      return { block: true, reason: formatDenyReason(effectiveCheck, agentName ?? undefined) };
     }
 
     // Run PreToolUse hooks (if configured) before prompting or allowing
-    let effectiveState = check.state;
+    let effectiveState = effectiveCheck.state;
     const preToolUseHooks = permissionManager.getHooks()?.PreToolUse;
     if (preToolUseHooks && preToolUseHooks.length > 0) {
       const hookContext: HookExecutionContext = {
@@ -1395,7 +1397,8 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       if (hookDecision.decision !== "defer") {
         writeDebugLog("hook.pretooluse_result", {
           toolName,
-          originalState: check.state,
+          policyState: check.state,
+          effectiveState: effectiveCheck.state,
           hookDecision: hookDecision.decision,
           hookReasons: hookDecision.reasons,
         });
@@ -1437,7 +1440,11 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
         if (hookDecision.decision === "allow") {
           effectiveState = "allow";
         } else if (hookDecision.decision === "ask") {
-          effectiveState = "ask";
+          // When the local-edit override auto-approved this call, a hook returning
+          // "ask" should not re-introduce a prompt — only "deny" can block it.
+          if (!localEditOverrideActive) {
+            effectiveState = "ask";
+          }
         }
       }
     }

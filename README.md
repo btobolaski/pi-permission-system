@@ -17,6 +17,7 @@ Permission enforcement extension for the Pi coding agent that provides centraliz
 - **MCP Access Control** — Server and tool-level permissions for MCP operations
 - **Skill Protection** — Controls which skills can be loaded or read from disk
 - **Per-Agent Overrides** — Agent-specific permission policies via YAML frontmatter
+- **Local Edit Auto-Approval** — Optional toggle to auto-approve `edit`/`write` within the working directory while hooks retain deny authority
 - **Subagent Permission Forwarding** — Forwards `ask` confirmations from non-UI subagents back to the main interactive session
 - **PreToolUse Hooks** — Execute external shell commands before tool calls, using the same protocol as [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks)
 - **File-Based Review Logging** — Writes permission request/denial review entries to a file by default for later auditing
@@ -91,13 +92,14 @@ The extension integrates via Pi's lifecycle hooks:
 
 **Location:** `~/.pi/agent/extensions/pi-permission-system/config.json`
 
-The extension creates this file automatically when it is missing. It controls only extension-local logging behavior:
+The extension creates this file automatically when it is missing. It controls extension-local behavior:
 
 ```json
 {
   "debugLog": false,
   "permissionReviewLog": true,
   "yoloMode": false,
+  "allowLocalEdits": false,
   "hooks": {}
 }
 ```
@@ -107,6 +109,7 @@ The extension creates this file automatically when it is missing. It controls on
 | `debugLog` | `false` | Enables verbose diagnostic logging to `logs/pi-permission-system-debug.jsonl` |
 | `permissionReviewLog` | `true` | Enables the permission request/denial review log at `logs/pi-permission-system-permission-review.jsonl` |
 | `yoloMode` | `false` | Auto-approve all `ask` permissions without prompting |
+| `allowLocalEdits` | `false` | Auto-approve `edit` and `write` tool calls targeting files within the working directory. PreToolUse hooks can still deny. |
 | `hooks` | `{}` | PreToolUse hook configuration (see [PreToolUse Hooks](#pretooluse-hooks) below) |
 
 Both logs write to files only under the extension directory. No debug output is printed to the terminal.
@@ -122,12 +125,15 @@ Hooks execute **after** the internal permission policy check but **before** any 
 ```
 tool_call event
   → permissionManager.checkPermission()
+  → if allowLocalEdits + local edit/write: override to allow
   → if deny: block (hooks never run)
   → if allow or ask: run PreToolUse hooks
     → hook decision overrides the original state
   → if ask: prompt user
   → if allow: proceed
 ```
+
+When `allowLocalEdits` is enabled, `deny` and `ask` states for `edit`/`write` calls targeting files within the working directory are overridden to `allow` before hooks run. Hooks can still return `deny` to block the call, but `ask` will not re-introduce a prompt for a local edit that was already auto-approved by the toggle.
 
 This means hooks can:
 - **Escalate** `allow` to `deny` or `ask` (security hooks inspecting command content)
@@ -636,6 +642,7 @@ index.ts                    → Root Pi entrypoint shim
 src/
 ├── index.ts                → Extension bootstrap, permission checks, review logging, and subagent forwarding
 ├── extension-config.ts     → Extension-local config loading and default creation
+├── local-edit.ts           → Path normalization and local-edit auto-approval logic
 ├── logging.ts              → File-only debug/review logging helpers
 ├── permission-manager.ts   → Policy loading, merging, and resolution with caching
 ├── bash-filter.ts          → Bash command wildcard pattern matching
@@ -664,6 +671,7 @@ The extension uses a modular architecture with shared utilities:
 | `wildcard-matcher.ts` | Compile-once wildcard patterns with specificity sorting: `compileWildcardPatterns()`, `findCompiledWildcardMatch()` |
 | `permission-manager.ts` | Policy resolution with file stamp caching for performance |
 | `bash-filter.ts` | Uses shared wildcard matcher for bash command patterns |
+| `local-edit.ts` | Path normalization and `shouldAllowLocalEdit()` predicate for the `allowLocalEdits` toggle |
 | `hook-types.ts` | Type definitions for hook configuration, I/O protocol, and results |
 | `hook-matcher.ts` | Pi ↔ Claude Code tool name mapping, regex matcher, `if` field parsing |
 | `hook-executor.ts` | Subprocess execution: spawn, stdin/stdout, timeout, exit code handling |

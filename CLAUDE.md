@@ -21,7 +21,7 @@ This is a **Pi coding agent extension** that enforces permission policies on too
 The extension exports three hooks from `src/index.ts`:
 
 1. **`before_agent_start`** — Pre-filters the agent's available tools, sanitizes denied tools from system prompts, hides denied skills
-2. **`tool_call`** — Runtime gate: resolves permission state (`allow`/`deny`/`ask`) for each tool invocation, then runs configured PreToolUse hooks (Claude Code-compatible shell commands) that can override the decision
+2. **`tool_call`** — Runtime gate: resolves permission state (`allow`/`deny`/`ask`) for each tool invocation, applies `allowLocalEdits` override for local edit/write, then runs configured PreToolUse hooks (Claude Code-compatible shell commands) that can override the decision
 3. **`input`** — Intercepts `/skill:<name>` requests to enforce skill policy
 
 ### Permission resolution
@@ -46,6 +46,7 @@ The extension exports three hooks from `src/index.ts`:
 | `permission-forwarding.ts` | IPC for subagent permission delegation to the main session |
 | `permission-dialog.ts` | TUI confirmation prompts |
 | `yolo-mode.ts` | Auto-approval bypass logic |
+| `local-edit.ts` | Path normalization and `allowLocalEdits` auto-approval predicate |
 | `logging.ts` | Structured JSONL logging (debug + review) |
 | `extension-config.ts` | Extension config loading/saving (`config.json`) |
 | `common.ts` | Shared utilities: YAML frontmatter parsing, type guards |

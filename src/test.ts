@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { BashFilter } from "./bash-filter.js";
@@ -21,6 +21,12 @@ import { getPermissionSystemStatus } from "./status.js";
 import { sanitizeAvailableToolsSection } from "./system-prompt-sanitizer.js";
 import type { GlobalPermissionConfig } from "./types.js";
 import { canResolveAskPermissionRequest, shouldAutoApprovePermissionState } from "./yolo-mode.js";
+import {
+  normalizePathForComparison,
+  isPathWithinDirectory,
+  extractNormalizedFilePath,
+  shouldAllowLocalEdit,
+} from "./local-edit.js";
 import {
   normalizePermissionDenialReason,
   createDeniedPermissionDecision,
@@ -115,6 +121,7 @@ runTest("Permission-system extension config defaults debug off, review log on, a
     assert.equal(raw.debugLog, false);
     assert.equal(raw.permissionReviewLog, true);
     assert.equal(raw.yoloMode, false);
+    assert.equal(raw.allowLocalEdits, false);
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
   }
@@ -142,6 +149,7 @@ runTest("Permission-system extension config loads yolo mode when explicitly enab
       debugLog: true,
       permissionReviewLog: false,
       yoloMode: true,
+      allowLocalEdits: false,
     });
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
@@ -182,6 +190,7 @@ runTest("Permission-system extension config save persists normalized config", ()
         debugLog: true,
         permissionReviewLog: false,
         yoloMode: true,
+        allowLocalEdits: false,
       },
       configPath,
     );
@@ -194,6 +203,7 @@ runTest("Permission-system extension config save persists normalized config", ()
       debugLog: true,
       permissionReviewLog: false,
       yoloMode: true,
+      allowLocalEdits: false,
     });
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
@@ -243,12 +253,111 @@ runTest("Yolo mode resolves ask permissions without UI or delegation forwarding"
   );
 });
 
-runTest("Permission-system status is only exposed when yolo mode is enabled", () => {
+runTest("Permission-system status reflects active modes", () => {
   assert.equal(getPermissionSystemStatus(DEFAULT_EXTENSION_CONFIG), undefined);
   assert.equal(
     getPermissionSystemStatus({ ...DEFAULT_EXTENSION_CONFIG, yoloMode: true }),
     "yolo",
   );
+  assert.equal(
+    getPermissionSystemStatus({ ...DEFAULT_EXTENSION_CONFIG, allowLocalEdits: true }),
+    "local-edits",
+  );
+  assert.equal(
+    getPermissionSystemStatus({ ...DEFAULT_EXTENSION_CONFIG, yoloMode: true, allowLocalEdits: true }),
+    "yolo+local-edits",
+  );
+});
+
+runTest("normalizePathForComparison resolves relative, tilde, and @-prefixed paths", () => {
+  const cwd = "/project";
+  assert.equal(normalizePathForComparison("src/foo.ts", cwd), "/project/src/foo.ts");
+  assert.equal(normalizePathForComparison("/absolute/path.ts", cwd), "/absolute/path.ts");
+  assert.equal(normalizePathForComparison("@src/bar.ts", cwd), "/project/src/bar.ts");
+  assert.equal(normalizePathForComparison("  src/foo.ts  ", cwd), "/project/src/foo.ts");
+  assert.equal(normalizePathForComparison("'src/foo.ts'", cwd), "/project/src/foo.ts");
+  assert.equal(normalizePathForComparison("", cwd), "");
+  assert.equal(normalizePathForComparison("   ", cwd), "");
+  assert.equal(normalizePathForComparison("../sibling/file.ts", cwd), "/sibling/file.ts");
+  assert.equal(normalizePathForComparison("~", cwd), homedir());
+  assert.equal(normalizePathForComparison("~/docs/foo.ts", cwd), join(homedir(), "docs/foo.ts"));
+});
+
+runTest("isPathWithinDirectory checks containment correctly", () => {
+  assert.equal(isPathWithinDirectory("/project/src/foo.ts", "/project"), true);
+  assert.equal(isPathWithinDirectory("/project", "/project"), true);
+  assert.equal(isPathWithinDirectory("/tmp/foo.ts", "/project"), false);
+  assert.equal(isPathWithinDirectory("/project-other/foo.ts", "/project"), false);
+  assert.equal(isPathWithinDirectory("", "/project"), false);
+  assert.equal(isPathWithinDirectory("/project/foo.ts", ""), false);
+});
+
+runTest("extractNormalizedFilePath extracts file_path or path from tool input", () => {
+  assert.equal(extractNormalizedFilePath({ file_path: "/project/foo.ts" }, "/project"), "/project/foo.ts");
+  assert.equal(extractNormalizedFilePath({ file_path: "src/foo.ts" }, "/project"), "/project/src/foo.ts");
+  // Pi uses path instead of file_path
+  assert.equal(extractNormalizedFilePath({ path: "flake.nix" }, "/project"), "/project/flake.nix");
+  assert.equal(extractNormalizedFilePath({ path: "/project/src/bar.ts" }, "/project"), "/project/src/bar.ts");
+  // file_path takes precedence over path
+  assert.equal(extractNormalizedFilePath({ file_path: "/a/b.ts", path: "/c/d.ts" }, "/project"), "/a/b.ts");
+  assert.equal(extractNormalizedFilePath({}, "/project"), null);
+  assert.equal(extractNormalizedFilePath({ file_path: "" }, "/project"), null);
+  assert.equal(extractNormalizedFilePath({ file_path: "   " }, "/project"), null);
+  assert.equal(extractNormalizedFilePath({ file_path: 123 }, "/project"), null);
+  assert.equal(extractNormalizedFilePath(null, "/project"), null);
+});
+
+runTest("shouldAllowLocalEdit returns true only for edit/write within cwd when toggle is on", () => {
+  const on = { ...DEFAULT_EXTENSION_CONFIG, allowLocalEdits: true };
+  const off = { ...DEFAULT_EXTENSION_CONFIG, allowLocalEdits: false };
+  const cwd = "/project";
+
+  // Toggle on, edit within cwd
+  assert.equal(shouldAllowLocalEdit("edit", { file_path: "/project/src/foo.ts" }, cwd, on), true);
+  assert.equal(shouldAllowLocalEdit("write", { file_path: "/project/src/foo.ts" }, cwd, on), true);
+
+  // Toggle off
+  assert.equal(shouldAllowLocalEdit("edit", { file_path: "/project/src/foo.ts" }, cwd, off), false);
+
+  // Wrong tool name
+  assert.equal(shouldAllowLocalEdit("read", { file_path: "/project/src/foo.ts" }, cwd, on), false);
+  assert.equal(shouldAllowLocalEdit("bash", { file_path: "/project/src/foo.ts" }, cwd, on), false);
+
+  // Outside cwd
+  assert.equal(shouldAllowLocalEdit("edit", { file_path: "/tmp/foo.ts" }, cwd, on), false);
+  assert.equal(shouldAllowLocalEdit("edit", { file_path: "/project-other/foo.ts" }, cwd, on), false);
+
+  // Traversal attempt
+  assert.equal(shouldAllowLocalEdit("edit", { file_path: "/project/../etc/passwd" }, cwd, on), false);
+
+  // Missing file_path
+  assert.equal(shouldAllowLocalEdit("edit", {}, cwd, on), false);
+  assert.equal(shouldAllowLocalEdit("edit", { file_path: "" }, cwd, on), false);
+
+  // Exact cwd root
+  assert.equal(shouldAllowLocalEdit("edit", { file_path: "/project" }, cwd, on), true);
+
+  // Pi uses path instead of file_path
+  assert.equal(shouldAllowLocalEdit("edit", { path: "flake.nix" }, cwd, on), true);
+  assert.equal(shouldAllowLocalEdit("edit", { path: "/tmp/outside.ts" }, cwd, on), false);
+});
+
+runTest("Permission-system extension config persists allowLocalEdits: true", () => {
+  const baseDir = mkdtempSync(join(tmpdir(), "pi-permission-system-config-local-edits-"));
+  const configPath = join(baseDir, "config.json");
+
+  try {
+    const saved = savePermissionSystemConfig(
+      { ...DEFAULT_EXTENSION_CONFIG, allowLocalEdits: true },
+      configPath,
+    );
+    assert.equal(saved.success, true);
+
+    const result = loadPermissionSystemConfig(configPath);
+    assert.equal(result.config.allowLocalEdits, true);
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true });
+  }
 });
 
 runTest("System prompt sanitizer removes the Available tools section and surrounding boilerplate", () => {

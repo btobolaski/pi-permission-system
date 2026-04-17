@@ -141,6 +141,7 @@ await runAsyncTest("permission-system command handlers manage config summary, pe
     debugLog: true,
     permissionReviewLog: false,
     yoloMode: true,
+    allowLocalEdits: true,
   };
 
   try {
@@ -183,6 +184,7 @@ await runAsyncTest("permission-system command handlers manage config summary, pe
     const infoCtx = createCommandContext(true);
     await definition?.handler("show", infoCtx.ctx);
     assert.ok(lastNotification(infoCtx.notifications).message.includes("yoloMode=on"));
+    assert.ok(lastNotification(infoCtx.notifications).message.includes("allowLocalEdits=on"));
     assert.ok(lastNotification(infoCtx.notifications).message.includes("debugLog=on"));
 
     await definition?.handler("path", infoCtx.ctx);

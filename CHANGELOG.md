@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `allowLocalEdits` config toggle: auto-approve `edit` and `write` tool calls targeting files within the working directory
+- New `local-edit.ts` module with path normalization and local-edit auto-approval logic
+- TUI settings modal entry for toggling local edits on/off at runtime
+- Status bar indicator (`local-edits`) when the toggle is active, combinable with yolo (`yolo+local-edits`)
+- Supports both `file_path` (Claude Code) and `path` (Pi) input field formats
+
+### Changed
+- PreToolUse hooks returning `ask` no longer downgrade the auto-approval when `allowLocalEdits` is active — only `deny` can block a local edit
+- `shouldExposeTool` keeps `edit`/`write` visible to the agent when `allowLocalEdits` is on, even if the global policy says `deny`
+- Hook debug log now records both `policyState` and `effectiveState` for clearer diagnostics
+
+### Tests
+- Added unit tests for `normalizePathForComparison`, `isPathWithinDirectory`, `extractNormalizedFilePath`, `shouldAllowLocalEdit`
+- Added config round-trip test for `allowLocalEdits: true`
+- Updated status test to cover combined mode display
+- Updated config-modal test to verify `allowLocalEdits` in show/reset output
+
 ## [0.4.1] - 2026-04-01
 
 ### Changed
