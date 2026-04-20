@@ -45,6 +45,8 @@ function cloneDefaultConfig(): PermissionSystemExtensionConfig {
     permissionReviewLog: DEFAULT_EXTENSION_CONFIG.permissionReviewLog,
     yoloMode: DEFAULT_EXTENSION_CONFIG.yoloMode,
     allowLocalEdits: DEFAULT_EXTENSION_CONFIG.allowLocalEdits,
+    allowWebAccess: DEFAULT_EXTENSION_CONFIG.allowWebAccess,
+    allowedFetchDomains: [...DEFAULT_EXTENSION_CONFIG.allowedFetchDomains],
   };
 }
 
@@ -56,6 +58,7 @@ function summarizeConfig(config: PermissionSystemExtensionConfig): string {
   return [
     `yoloMode=${toOnOff(config.yoloMode)}`,
     `allowLocalEdits=${toOnOff(config.allowLocalEdits)}`,
+    `allowWebAccess=${toOnOff(config.allowWebAccess)}`,
     `permissionReviewLog=${toOnOff(config.permissionReviewLog)}`,
     `debugLog=${toOnOff(config.debugLog)}`,
   ].join(", ");
@@ -75,6 +78,13 @@ function buildSettingItems(config: PermissionSystemExtensionConfig): SettingItem
       label: "Allow local edits",
       description: "Auto-approve edit and write tool calls targeting files within the working directory",
       currentValue: toOnOff(config.allowLocalEdits),
+      values: ON_OFF,
+    },
+    {
+      id: "allowWebAccess",
+      label: "Allow web access",
+      description: "Auto-approve web_search and get_search_content; prompt with domain options for fetch_content",
+      currentValue: toOnOff(config.allowWebAccess),
       values: ON_OFF,
     },
     {
@@ -104,6 +114,8 @@ function applySetting(
       return { ...config, yoloMode: value === "on" };
     case "allowLocalEdits":
       return { ...config, allowLocalEdits: value === "on" };
+    case "allowWebAccess":
+      return { ...config, allowWebAccess: value === "on" };
     case "permissionReviewLog":
       return { ...config, permissionReviewLog: value === "on" };
     case "debugLog":
@@ -116,6 +128,7 @@ function applySetting(
 function syncSettingValues(settingsList: SettingValueSyncTarget, config: PermissionSystemExtensionConfig): void {
   settingsList.updateValue("yoloMode", toOnOff(config.yoloMode));
   settingsList.updateValue("allowLocalEdits", toOnOff(config.allowLocalEdits));
+  settingsList.updateValue("allowWebAccess", toOnOff(config.allowWebAccess));
   settingsList.updateValue("permissionReviewLog", toOnOff(config.permissionReviewLog));
   settingsList.updateValue("debugLog", toOnOff(config.debugLog));
 }

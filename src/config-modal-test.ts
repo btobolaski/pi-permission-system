@@ -138,6 +138,7 @@ await runAsyncTest("permission-system command handlers manage config summary, pe
   const baseDir = mkdtempSync(join(tmpdir(), "pi-permission-system-command-"));
   const configPath = join(baseDir, "config.json");
   let config: PermissionSystemExtensionConfig = {
+    ...DEFAULT_EXTENSION_CONFIG,
     debugLog: true,
     permissionReviewLog: false,
     yoloMode: true,
@@ -185,6 +186,7 @@ await runAsyncTest("permission-system command handlers manage config summary, pe
     await definition?.handler("show", infoCtx.ctx);
     assert.ok(lastNotification(infoCtx.notifications).message.includes("yoloMode=on"));
     assert.ok(lastNotification(infoCtx.notifications).message.includes("allowLocalEdits=on"));
+    assert.ok(lastNotification(infoCtx.notifications).message.includes("allowWebAccess=off"));
     assert.ok(lastNotification(infoCtx.notifications).message.includes("debugLog=on"));
 
     await definition?.handler("path", infoCtx.ctx);

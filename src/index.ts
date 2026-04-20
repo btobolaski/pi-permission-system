@@ -37,8 +37,15 @@ import { normalizePathForComparison, isPathWithinDirectory, shouldAllowLocalEdit
 import {
   createDeniedPermissionDecision,
   requestPermissionDecisionFromUi,
+  requestWebAccessPermissionFromUi,
   type PermissionPromptDecision,
 } from "./permission-dialog.js";
+import {
+  shouldAllowWebSearch,
+  shouldAllowFetchForDomain,
+  isWebAccessTool,
+  extractDomainFromUrl,
+} from "./web-access.js";
 
 const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
 const SESSIONS_DIR = join(PI_AGENT_DIR, "sessions");
@@ -880,6 +887,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
   let isProcessingForwardedRequests = false;
   let runtimeContext: ExtensionContext | null = null;
   let lastConfigWarning: string | null = null;
+  let sessionAllowedFetchDomains = new Set<string>();
 
   const notifyWarning = (message: string): void => {
     if (!runtimeContext?.hasUI) {
@@ -915,6 +923,8 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       permissionReviewLog: result.config.permissionReviewLog,
       yoloMode: result.config.yoloMode,
       allowLocalEdits: result.config.allowLocalEdits,
+      allowWebAccess: result.config.allowWebAccess,
+      allowedFetchDomains: result.config.allowedFetchDomains,
     });
   };
 
@@ -937,6 +947,8 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       permissionReviewLog: normalized.permissionReviewLog,
       yoloMode: normalized.yoloMode,
       allowLocalEdits: normalized.allowLocalEdits,
+      allowWebAccess: normalized.allowWebAccess,
+      allowedFetchDomains: normalized.allowedFetchDomains,
     });
   };
 
@@ -1132,6 +1144,10 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     if (extensionConfig.allowLocalEdits && (toolName === "edit" || toolName === "write")) {
       return true;
     }
+    // The tool_call hook resolves fetch_content domains per-call at call time.
+    if (extensionConfig.allowWebAccess && isWebAccessTool(toolName)) {
+      return true;
+    }
     return false;
   };
 
@@ -1141,6 +1157,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     permissionManager = new PermissionManager();
     activeSkillEntries = [];
     lastKnownActiveAgentName = getActiveAgentName(ctx);
+    sessionAllowedFetchDomains = new Set<string>();
     startForwardedPermissionPolling(ctx);
   });
 
@@ -1149,6 +1166,7 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     refreshExtensionConfig(ctx);
     activeSkillEntries = [];
     lastKnownActiveAgentName = getActiveAgentName(ctx);
+    sessionAllowedFetchDomains = new Set<string>();
     startForwardedPermissionPolling(ctx);
   });
 
@@ -1363,6 +1381,44 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
       localEditOverrideActive = true;
     }
 
+    let webAccessOverrideActive = false;
+    if (effectiveCheck.state !== "allow" && shouldAllowWebSearch(toolName, extensionConfig)) {
+      writeDebugLog("allow_web_access.override", {
+        toolName,
+        originalState: effectiveCheck.state,
+      });
+      writeReviewLog("permission_request.web_access_allowed", {
+        source: "tool_call",
+        toolCallId: event.toolCallId,
+        toolName,
+        agentName,
+        ...permissionLogContext,
+        resolution: "allow_web_access",
+      });
+      effectiveCheck = { ...effectiveCheck, state: "allow" };
+      webAccessOverrideActive = true;
+    }
+
+    if (effectiveCheck.state !== "allow" && shouldAllowFetchForDomain(toolName, input, extensionConfig, sessionAllowedFetchDomains)) {
+      const domain = extractDomainFromUrl(input);
+      writeDebugLog("allow_web_access.domain_override", {
+        toolName,
+        originalState: effectiveCheck.state,
+        domain,
+      });
+      writeReviewLog("permission_request.web_access_domain_allowed", {
+        source: "tool_call",
+        toolCallId: event.toolCallId,
+        toolName,
+        agentName,
+        domain,
+        ...permissionLogContext,
+        resolution: "allow_web_access_domain",
+      });
+      effectiveCheck = { ...effectiveCheck, state: "allow" };
+      webAccessOverrideActive = true;
+    }
+
     if (effectiveCheck.state === "deny") {
       writeReviewLog("permission_request.blocked", {
         source: "tool_call",
@@ -1440,9 +1496,9 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
         if (hookDecision.decision === "allow") {
           effectiveState = "allow";
         } else if (hookDecision.decision === "ask") {
-          // When the local-edit override auto-approved this call, a hook returning
-          // "ask" should not re-introduce a prompt — only "deny" can block it.
-          if (!localEditOverrideActive) {
+          // When a config override (local-edit, web-access) auto-approved this call,
+          // a hook returning "ask" should not re-introduce a prompt — only "deny" can block it.
+          if (!localEditOverrideActive && !webAccessOverrideActive) {
             effectiveState = "ask";
           }
         }
@@ -1471,6 +1527,88 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
           block: true,
           reason: unavailableReason,
         };
+      }
+
+      // Enhanced fetch_content dialog when web access is enabled, domain is extractable,
+      // and yolo mode is not active (yolo delegates to promptPermission for consistent event handling)
+      if (
+        toolName === "fetch_content"
+        && extensionConfig.allowWebAccess
+        && ctx.hasUI
+        && !shouldAutoApprovePermissionState("ask", extensionConfig)
+      ) {
+        const fetchDomain = extractDomainFromUrl(input);
+        if (fetchDomain) {
+          const permissionDetails = {
+            requestId: event.toolCallId,
+            source: "tool_call" as const,
+            agentName,
+            message,
+            toolCallId: event.toolCallId,
+            toolName,
+            ...permissionLogContext,
+          };
+
+          reviewPermissionDecision("permission_request.waiting", permissionDetails);
+          emitPermissionRequestEvent({
+            requestId: event.toolCallId,
+            source: "tool_call",
+            state: "waiting",
+            message,
+            toolCallId: event.toolCallId,
+            toolName,
+            agentName,
+          });
+
+          const webDecision = await requestWebAccessPermissionFromUi(
+            ctx.ui,
+            "Permission Required",
+            message,
+            fetchDomain,
+          );
+
+          if (webDecision.approved && webDecision.domainAction === "allow_persist" && webDecision.domain) {
+            const updatedDomains = [...new Set([...extensionConfig.allowedFetchDomains, webDecision.domain])];
+            const updatedConfig = { ...extensionConfig, allowedFetchDomains: updatedDomains };
+            const saved = savePermissionSystemConfig(updatedConfig);
+            if (saved.success) {
+              setExtensionConfig(updatedConfig);
+              syncPermissionSystemStatus(ctx, updatedConfig);
+              writeDebugLog("web_access.domain_persisted", { domain: webDecision.domain });
+            }
+            writeReviewLog("web_access.domain_persisted", {
+              domain: webDecision.domain,
+              toolCallId: event.toolCallId,
+            });
+          } else if (webDecision.approved && webDecision.domainAction === "allow_session" && webDecision.domain) {
+            sessionAllowedFetchDomains.add(webDecision.domain);
+            writeReviewLog("web_access.domain_session_allowed", {
+              domain: webDecision.domain,
+              toolCallId: event.toolCallId,
+            });
+          }
+
+          reviewPermissionDecision(
+            webDecision.approved ? "permission_request.approved" : "permission_request.denied",
+            { ...permissionDetails, denialReason: webDecision.denialReason },
+          );
+          emitPermissionRequestEvent({
+            requestId: event.toolCallId,
+            source: "tool_call",
+            state: webDecision.approved ? "approved" : "denied",
+            message,
+            toolCallId: event.toolCallId,
+            toolName,
+            agentName,
+            denialReason: webDecision.denialReason,
+          });
+
+          if (!webDecision.approved) {
+            return { block: true, reason: formatUserDeniedReason(check, webDecision.denialReason) };
+          }
+
+          return {};
+        }
       }
 
       const decision = await promptPermission(ctx, {

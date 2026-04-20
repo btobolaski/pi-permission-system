@@ -51,6 +51,51 @@ export function isPermissionDecisionState(
   return value === "approved" || value === "denied" || value === "denied_with_reason";
 }
 
+export type WebAccessPermissionDecision = PermissionPromptDecision & {
+  domainAction?: "allow_persist" | "allow_session";
+  domain?: string;
+};
+
+export async function requestWebAccessPermissionFromUi(
+  ui: PermissionDecisionUi,
+  title: string,
+  message: string,
+  domain: string,
+): Promise<WebAccessPermissionDecision> {
+  const alwaysAllowOption = `Yes, always allow ${domain}`;
+  const sessionAllowOption = `Yes, allow ${domain} for this session`;
+
+  const selected = await ui.select(
+    `${title}\n${message}`,
+    [APPROVE_OPTION, alwaysAllowOption, sessionAllowOption, DENY_OPTION, DENY_WITH_REASON_OPTION],
+  );
+
+  if (selected === APPROVE_OPTION) {
+    return { approved: true, state: "approved" };
+  }
+
+  if (selected === alwaysAllowOption) {
+    return { approved: true, state: "approved", domainAction: "allow_persist", domain };
+  }
+
+  if (selected === sessionAllowOption) {
+    return { approved: true, state: "approved", domainAction: "allow_session", domain };
+  }
+
+  if (selected === DENY_WITH_REASON_OPTION) {
+    const denialReason = normalizePermissionDenialReason(
+      await ui.input(
+        `${title}\nShare why this request was denied (optional).`,
+        "Reason shown back to the agent",
+      ),
+    );
+
+    return createDeniedPermissionDecision(denialReason);
+  }
+
+  return createDeniedPermissionDecision();
+}
+
 export async function requestPermissionDecisionFromUi(
   ui: PermissionDecisionUi,
   title: string,

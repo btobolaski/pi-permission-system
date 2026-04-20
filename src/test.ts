@@ -32,8 +32,15 @@ import {
   createDeniedPermissionDecision,
   isPermissionDecisionState,
   requestPermissionDecisionFromUi,
+  requestWebAccessPermissionFromUi,
   type PermissionDecisionUi,
 } from "./permission-dialog.js";
+import {
+  extractDomainFromUrl,
+  isWebAccessTool,
+  shouldAllowWebSearch,
+  shouldAllowFetchForDomain,
+} from "./web-access.js";
 
 type CreateManagerOptions = {
   mcpServerNames?: readonly string[];
@@ -150,6 +157,8 @@ runTest("Permission-system extension config loads yolo mode when explicitly enab
       permissionReviewLog: false,
       yoloMode: true,
       allowLocalEdits: false,
+      allowWebAccess: false,
+      allowedFetchDomains: [],
     });
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
@@ -191,6 +200,8 @@ runTest("Permission-system extension config save persists normalized config", ()
         permissionReviewLog: false,
         yoloMode: true,
         allowLocalEdits: false,
+        allowWebAccess: false,
+        allowedFetchDomains: [],
       },
       configPath,
     );
@@ -204,6 +215,8 @@ runTest("Permission-system extension config save persists normalized config", ()
       permissionReviewLog: false,
       yoloMode: true,
       allowLocalEdits: false,
+      allowWebAccess: false,
+      allowedFetchDomains: [],
     });
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
@@ -266,6 +279,22 @@ runTest("Permission-system status reflects active modes", () => {
   assert.equal(
     getPermissionSystemStatus({ ...DEFAULT_EXTENSION_CONFIG, yoloMode: true, allowLocalEdits: true }),
     "yolo+local-edits",
+  );
+  assert.equal(
+    getPermissionSystemStatus({ ...DEFAULT_EXTENSION_CONFIG, allowWebAccess: true }),
+    "web-access",
+  );
+  assert.equal(
+    getPermissionSystemStatus({ ...DEFAULT_EXTENSION_CONFIG, allowLocalEdits: true, allowWebAccess: true }),
+    "local-edits+web-access",
+  );
+  assert.equal(
+    getPermissionSystemStatus({ ...DEFAULT_EXTENSION_CONFIG, yoloMode: true, allowWebAccess: true }),
+    "yolo+web-access",
+  );
+  assert.equal(
+    getPermissionSystemStatus({ ...DEFAULT_EXTENSION_CONFIG, yoloMode: true, allowLocalEdits: true, allowWebAccess: true }),
+    "yolo+local-edits+web-access",
   );
 });
 
@@ -355,6 +384,144 @@ runTest("Permission-system extension config persists allowLocalEdits: true", () 
 
     const result = loadPermissionSystemConfig(configPath);
     assert.equal(result.config.allowLocalEdits, true);
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+runTest("extractDomainFromUrl extracts hostname from tool input", () => {
+  assert.equal(extractDomainFromUrl({ url: "https://example.com/path" }), "example.com");
+  assert.equal(extractDomainFromUrl({ url: "https://WWW.Example.COM/page" }), "www.example.com");
+  assert.equal(extractDomainFromUrl({ url: "http://sub.domain.org:8080/api" }), "sub.domain.org");
+  assert.equal(extractDomainFromUrl({ url: "example.com/path" }), "example.com");
+  assert.equal(extractDomainFromUrl({ url: "docs.rs" }), "docs.rs");
+
+  // Invalid/missing
+  assert.equal(extractDomainFromUrl({ url: "" }), null);
+  assert.equal(extractDomainFromUrl({ url: "   " }), null);
+  assert.equal(extractDomainFromUrl({}), null);
+  assert.equal(extractDomainFromUrl({ url: 123 }), null);
+  assert.equal(extractDomainFromUrl(null), null);
+});
+
+runTest("isWebAccessTool recognizes web tools", () => {
+  assert.equal(isWebAccessTool("web_search"), true);
+  assert.equal(isWebAccessTool("get_search_content"), true);
+  assert.equal(isWebAccessTool("fetch_content"), true);
+  assert.equal(isWebAccessTool("edit"), false);
+  assert.equal(isWebAccessTool("bash"), false);
+  assert.equal(isWebAccessTool("read"), false);
+});
+
+runTest("shouldAllowWebSearch returns true only for search tools when toggle is on", () => {
+  const on = { ...DEFAULT_EXTENSION_CONFIG, allowWebAccess: true };
+  const off = { ...DEFAULT_EXTENSION_CONFIG, allowWebAccess: false };
+
+  assert.equal(shouldAllowWebSearch("web_search", on), true);
+  assert.equal(shouldAllowWebSearch("get_search_content", on), true);
+
+  // Toggle off
+  assert.equal(shouldAllowWebSearch("web_search", off), false);
+  assert.equal(shouldAllowWebSearch("get_search_content", off), false);
+
+  // Wrong tool
+  assert.equal(shouldAllowWebSearch("fetch_content", on), false);
+  assert.equal(shouldAllowWebSearch("edit", on), false);
+  assert.equal(shouldAllowWebSearch("bash", on), false);
+});
+
+runTest("shouldAllowFetchForDomain checks domain lists and toggle", () => {
+  const on = { ...DEFAULT_EXTENSION_CONFIG, allowWebAccess: true, allowedFetchDomains: ["example.com"] };
+  const off = { ...DEFAULT_EXTENSION_CONFIG, allowWebAccess: false, allowedFetchDomains: ["example.com"] };
+  const sessionDomains = new Set(["session.org"]);
+  const emptySession = new Set<string>();
+
+  // Persisted domain match
+  assert.equal(shouldAllowFetchForDomain("fetch_content", { url: "https://example.com/page" }, on, emptySession), true);
+
+  // Session domain match
+  assert.equal(shouldAllowFetchForDomain("fetch_content", { url: "https://session.org/api" }, on, sessionDomains), true);
+
+  // Domain in both lists (short-circuit via ||)
+  const bothDomains = new Set(["example.com"]);
+  assert.equal(shouldAllowFetchForDomain("fetch_content", { url: "https://example.com/page" }, on, bothDomains), true);
+
+  // Unknown domain
+  assert.equal(shouldAllowFetchForDomain("fetch_content", { url: "https://unknown.com/page" }, on, emptySession), false);
+
+  // Toggle off
+  assert.equal(shouldAllowFetchForDomain("fetch_content", { url: "https://example.com/page" }, off, emptySession), false);
+
+  // Wrong tool
+  assert.equal(shouldAllowFetchForDomain("web_search", { url: "https://example.com/page" }, on, emptySession), false);
+
+  // No url in input
+  assert.equal(shouldAllowFetchForDomain("fetch_content", {}, on, emptySession), false);
+
+  // Invalid url
+  assert.equal(shouldAllowFetchForDomain("fetch_content", { url: "" }, on, emptySession), false);
+});
+
+runTest("Permission-system extension config persists allowWebAccess and allowedFetchDomains", () => {
+  const baseDir = mkdtempSync(join(tmpdir(), "pi-permission-system-config-web-access-"));
+  const configPath = join(baseDir, "config.json");
+
+  try {
+    const saved = savePermissionSystemConfig(
+      { ...DEFAULT_EXTENSION_CONFIG, allowWebAccess: true, allowedFetchDomains: ["example.com", "docs.rs"] },
+      configPath,
+    );
+    assert.equal(saved.success, true);
+
+    const result = loadPermissionSystemConfig(configPath);
+    assert.equal(result.config.allowWebAccess, true);
+    assert.deepEqual(result.config.allowedFetchDomains, ["example.com", "docs.rs"]);
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+runTest("Permission-system config normalizes allowedFetchDomains from invalid input", () => {
+  const baseDir = mkdtempSync(join(tmpdir(), "pi-permission-system-config-domains-normalize-"));
+  const configPath = join(baseDir, "config.json");
+
+  try {
+    // Write config with invalid domain entries
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        ...DEFAULT_EXTENSION_CONFIG,
+        allowWebAccess: true,
+        allowedFetchDomains: ["EXAMPLE.COM", 42, "", "  docs.rs  ", null, "example.com"],
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    const result = loadPermissionSystemConfig(configPath);
+    assert.equal(result.config.allowWebAccess, true);
+    // Should lowercase, trim, deduplicate, and filter non-strings/empties
+    assert.deepEqual(result.config.allowedFetchDomains, ["example.com", "docs.rs"]);
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+runTest("Permission-system config normalizes non-array allowedFetchDomains to empty array", () => {
+  const baseDir = mkdtempSync(join(tmpdir(), "pi-permission-system-config-domains-scalar-"));
+  const configPath = join(baseDir, "config.json");
+
+  try {
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        ...DEFAULT_EXTENSION_CONFIG,
+        allowedFetchDomains: "example.com",
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    const result = loadPermissionSystemConfig(configPath);
+    assert.deepEqual(result.config.allowedFetchDomains, []);
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
   }
@@ -2064,6 +2231,83 @@ runTest("requestPermissionDecisionFromUi returns denied when select is dismissed
     input: async () => { throw new Error("should not be called"); },
   };
   const result = await requestPermissionDecisionFromUi(ui, "title", "message");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied");
+});
+
+runTest("requestWebAccessPermissionFromUi returns approved for Yes", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async (_title: string, options: string[]) => {
+      assert.equal(options.length, 5);
+      assert.ok(options.includes("Yes"));
+      assert.ok(options.includes("Yes, always allow example.com"));
+      assert.ok(options.includes("Yes, allow example.com for this session"));
+      assert.ok(options.includes("No"));
+      assert.ok(options.includes("No, provide reason"));
+      return "Yes";
+    },
+    input: async () => { throw new Error("should not be called"); },
+  };
+  const result = await requestWebAccessPermissionFromUi(ui, "title", "message", "example.com");
+  assert.equal(result.approved, true);
+  assert.equal(result.state, "approved");
+  assert.equal(result.domainAction, undefined);
+  assert.equal(result.domain, undefined);
+});
+
+runTest("requestWebAccessPermissionFromUi returns allow_persist for always allow domain", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => "Yes, always allow example.com",
+    input: async () => { throw new Error("should not be called"); },
+  };
+  const result = await requestWebAccessPermissionFromUi(ui, "title", "message", "example.com");
+  assert.equal(result.approved, true);
+  assert.equal(result.state, "approved");
+  assert.equal(result.domainAction, "allow_persist");
+  assert.equal(result.domain, "example.com");
+});
+
+runTest("requestWebAccessPermissionFromUi returns allow_session for session allow domain", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => "Yes, allow example.com for this session",
+    input: async () => { throw new Error("should not be called"); },
+  };
+  const result = await requestWebAccessPermissionFromUi(ui, "title", "message", "example.com");
+  assert.equal(result.approved, true);
+  assert.equal(result.state, "approved");
+  assert.equal(result.domainAction, "allow_session");
+  assert.equal(result.domain, "example.com");
+});
+
+runTest("requestWebAccessPermissionFromUi returns denied for No", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => "No",
+    input: async () => { throw new Error("should not be called"); },
+  };
+  const result = await requestWebAccessPermissionFromUi(ui, "title", "message", "example.com");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied");
+  assert.equal(result.domainAction, undefined);
+});
+
+runTest("requestWebAccessPermissionFromUi returns denied_with_reason when reason provided", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => "No, provide reason",
+    input: async () => "not needed",
+  };
+  const result = await requestWebAccessPermissionFromUi(ui, "title", "message", "example.com");
+  assert.equal(result.approved, false);
+  assert.equal(result.state, "denied_with_reason");
+  assert.equal(result.denialReason, "not needed");
+  assert.equal(result.domainAction, undefined);
+});
+
+runTest("requestWebAccessPermissionFromUi returns denied when dismissed", async () => {
+  const ui: PermissionDecisionUi = {
+    select: async () => undefined,
+    input: async () => { throw new Error("should not be called"); },
+  };
+  const result = await requestWebAccessPermissionFromUi(ui, "title", "message", "example.com");
   assert.equal(result.approved, false);
   assert.equal(result.state, "denied");
 });

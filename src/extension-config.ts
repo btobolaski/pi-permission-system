@@ -11,6 +11,8 @@ export interface PermissionSystemExtensionConfig {
   permissionReviewLog: boolean;
   yoloMode: boolean;
   allowLocalEdits: boolean;
+  allowWebAccess: boolean;
+  allowedFetchDomains: string[];
 }
 
 export interface PermissionSystemConfigLoadResult {
@@ -29,6 +31,8 @@ export const DEFAULT_EXTENSION_CONFIG: PermissionSystemExtensionConfig = {
   permissionReviewLog: true,
   yoloMode: false,
   allowLocalEdits: false,
+  allowWebAccess: false,
+  allowedFetchDomains: [],
 };
 
 export function resolveExtensionRoot(moduleUrl = import.meta.url): string {
@@ -47,11 +51,35 @@ function cloneDefaultConfig(): PermissionSystemExtensionConfig {
     permissionReviewLog: DEFAULT_EXTENSION_CONFIG.permissionReviewLog,
     yoloMode: DEFAULT_EXTENSION_CONFIG.yoloMode,
     allowLocalEdits: DEFAULT_EXTENSION_CONFIG.allowLocalEdits,
+    allowWebAccess: DEFAULT_EXTENSION_CONFIG.allowWebAccess,
+    allowedFetchDomains: [...DEFAULT_EXTENSION_CONFIG.allowedFetchDomains],
   };
 }
 
 function createDefaultConfigContent(): string {
   return `${JSON.stringify(DEFAULT_EXTENSION_CONFIG, null, 2)}\n`;
+}
+
+function normalizeStringArray(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const item of raw) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const normalized = item.trim().toLowerCase();
+    if (normalized && !seen.has(normalized)) {
+      seen.add(normalized);
+      result.push(normalized);
+    }
+  }
+
+  return result;
 }
 
 export function normalizePermissionSystemConfig(raw: unknown): PermissionSystemExtensionConfig {
@@ -61,6 +89,8 @@ export function normalizePermissionSystemConfig(raw: unknown): PermissionSystemE
     permissionReviewLog: record.permissionReviewLog !== false,
     yoloMode: record.yoloMode === true,
     allowLocalEdits: record.allowLocalEdits === true,
+    allowWebAccess: record.allowWebAccess === true,
+    allowedFetchDomains: normalizeStringArray(record.allowedFetchDomains),
   };
 }
 
